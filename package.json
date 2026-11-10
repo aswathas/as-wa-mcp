@@ -1,0 +1,37 @@
+{
+  "name": "wa-mcp",
+  "version": "1.0.0",
+  "description": "WhatsApp MCP server + CLI (multi-device, Baileys)",
+  "main": "dist/mcp.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start": "node dist/mcp.js",
+    "prepare": "npm run build"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "pino": "^10.4.0",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/qrcode-terminal": "^0.12.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  },
+  "bin": {
+    "wa-mcp": "dist/cli.js",
+    "wa-mcp-server": "dist/mcp.js"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
