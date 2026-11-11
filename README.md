@@ -64,7 +64,7 @@ claude mcp add whatsapp -- node C:/Users/aswat/Projects/wa-mcp/dist/mcp.js
 ## Tool reference
 
 All tools return `{ "ok": true, "data": …, "error": null }` or `{ "ok": false, "data": null, "error": { "code", "message", "hint?" } }`.
-17 tools — see [COMPETITORS.md](COMPETITORS.md) for how this compares with the field.
+**28 tools** — see [COMPETITORS.md](COMPETITORS.md) for how this compares with the field.
 
 | Tool | Args | Returns (`data`) |
 |---|---|---|
@@ -74,15 +74,26 @@ All tools return `{ "ok": true, "data": …, "error": null }` or `{ "ok": false,
 | `send_sticker` | `to`, `media_path` (.webp) | `{ to, sticker }` |
 | `react_message` | `chat`, `message_id`, `emoji` | `{ chat, message_id, emoji }` |
 | `mark_read` | `chat`, `message_id?` | `{ chat, marked }` |
+| `edit_message` | `chat`, `message_id`, `text` | `{ chat, message_id, edited }` |
+| `delete_message` | `chat`, `message_id` | `{ chat, message_id, revoked }` |
+| `send_typing` | `chat`, `state?` | `{ chat, state }` |
 | `get_profile` | – | `{ number, jid, name, lid }` |
 | `search_contacts` | `query`, `limit?` | `[{ id, name, number }]` |
+| `list_contacts` | `limit?` | all known contacts, alphabetical |
 | `search_messages` | `query`, `limit?` | `[{ id, chat, chat_name, from, fromMe, ts, type, text, has_media? }]` |
 | `list_chats` | `limit?` (1–200, default 20) | `[{ id, name, last_ts, unread? }]`, newest first |
 | `get_chat` | `chat` | `{ id, name, is_group, last_ts, unread?, message_count }` |
 | `get_messages` | `chat`, `limit?` | `[{ id, chat, from, fromMe, ts, type, text, pushName?, has_media? }]`, oldest first |
 | `get_last_interaction` | `chat` | last message or `null` |
 | `get_message_context` | `chat`, `message_id`, `before?`, `after?` | `{ messages[], index }` |
+| `get_new_messages` | `since_ts`, `limit?`, `chat?` | cursor read, oldest first |
+| `wait_for_messages` | `timeout_s?` (≤60), `chat?` | `{ messages[], timed_out }` — long-poll |
 | `get_group_info` | `chat` (@g.us) | `{ subject, owner, description, created_at, participant_count, participants[] }` |
+| `leave_group` | `chat` | `{ chat, left }` |
+| `group_participants` | `chat`, `action` (add/remove/promote/demote), `phones[]` | `{ chat, action, results[] }` |
+| `get_group_invite` | `chat`, `reset?` | `{ invite_code, link }` |
+| `update_group` | `chat`, `subject?`, `description?` | `{ chat, subject, description }` |
+| `create_group` | `subject`, `phones[]` | `{ id, subject, participant_count }` |
 | `download_media` | `chat`, `message_id`, `save_dir?` | `{ path, bytes, mimetype }` |
 | `get_status` | – | `{ status: paired\|pairing\|not_paired, connected, uptime_s, connected_for_s, last_reconnect, reconnect_count, last_error, me, hint? }` |
 
@@ -116,6 +127,17 @@ node dist/cli.js loc <to> <lat> <lng> [name] [address]
 node dist/cli.js sticker <to> <path.webp>
 node dist/cli.js vcard <to> <name> <phone> [email]
 node dist/cli.js group <chat>
+node dist/cli.js edit <chat> <message_id> <text>
+node dist/cli.js del <chat> <message_id>
+node dist/cli.js typing <chat> [state]
+node dist/cli.js all-contacts [limit]
+node dist/cli.js new [since_ts] [limit] [chat]
+node dist/cli.js wait [chat] [seconds]
+node dist/cli.js leave <chat>
+node dist/cli.js participants <action> <chat> <phone...>
+node dist/cli.js invite <chat> [--reset]
+node dist/cli.js group-set <chat> [--subject <s>] [--description <d>]
+node dist/cli.js create-group <subject> <phone...>
 ```
 
 `node scripts/list-tools.mjs` spawns the built server and prints the live tool list.

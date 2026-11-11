@@ -43,11 +43,41 @@ export class FakeSocket implements WaSocketLike {
   async readMessages(keys: { remoteJid: string; id: string; fromMe?: boolean }[]): Promise<void> {
     this.readCalls.push(keys);
   }
+  presenceCalls: { state: string; jid?: string }[] = [];
+  async sendPresenceUpdate(state: string, jid?: string): Promise<void> {
+    this.presenceCalls.push({ state, ...(jid ? { jid } : {}) });
+  }
   groups: Record<string, { id?: string; subject?: string; owner?: string; desc?: string; creation?: number; participants?: { id?: string; admin?: string | null }[] }> = {};
   async groupMetadata(jid: string) {
     const g = this.groups[jid];
     if (!g) throw new Error(`no group metadata for ${jid}`);
     return g;
+  }
+  groupCalls: { op: string; target: string; args?: unknown }[] = [];
+  async groupLeave(jid: string): Promise<void> {
+    this.groupCalls.push({ op: 'leave', target: jid });
+  }
+  async groupParticipantsUpdate(jid: string, users: string[], action: 'add' | 'remove' | 'promote' | 'demote') {
+    this.groupCalls.push({ op: action, target: jid, args: users });
+    return users.map((u) => ({ status: '200', jid: u }));
+  }
+  async groupInviteCode(jid: string): Promise<string> {
+    this.groupCalls.push({ op: 'invite', target: jid });
+    return 'INVITECODE';
+  }
+  async groupRevokeInvite(jid: string): Promise<string> {
+    this.groupCalls.push({ op: 'revoke', target: jid });
+    return 'NEWCODE';
+  }
+  async groupCreate(subject: string, participants: string[]) {
+    this.groupCalls.push({ op: 'create', target: subject, args: participants });
+    return { id: '120363012345678901@g.us', subject, participants: participants.map((id) => ({ id })) };
+  }
+  async groupUpdateSubject(jid: string, subject: string): Promise<void> {
+    this.groupCalls.push({ op: 'subject', target: jid, args: subject });
+  }
+  async groupUpdateDescription(jid: string, description?: string): Promise<void> {
+    this.groupCalls.push({ op: 'description', target: jid, args: description });
   }
   async logout(): Promise<void> {}
   end(): void {

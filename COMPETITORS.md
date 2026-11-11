@@ -11,7 +11,7 @@ market sweep. Here is the sweep, the gap, and what we did about it.
 | **spirit122 WhatsApp MCP** | Cloud API wrapper (Meta Business) | **35** across 8 modules (some Pro/Enterprise) | Official WhatsApp Business Cloud API | Templates, buttons/lists, flows, catalogs, analytics, business profile, webhooks-as-polling, safety/allowlist, AI auto-reply. Requires a Business account + phone number + API key. |
 | **Hosted services** (Blueticks, Spun, Perisclaw, Kondo/Volt) | Managed MCP endpoint | varies | Linked devices, hosted | Zero setup, paid, data leaves the machine. |
 | **AiChargeLabs Everyhand** (what we replaced) | MCP + licence | ~5–8 | Linked devices | Licence-gated — suspended on this machine. The reason we built ours. |
-| **wa-mcp (ours)** | Single Node process, MCP **and** CLI on one core | **17** | Linked devices (Baileys v7) | No licence, no bridge, no Business account. |
+| **wa-mcp (ours)** | Single Node process, MCP **and** CLI on one core | **28** | Linked devices (Baileys v7) | No licence, no bridge, no Business account. |
 
 ## Tool-by-tool matrix
 
@@ -34,9 +34,14 @@ market sweep. Here is the sweep, the gap, and what we did about it.
 | Message context (before/after) | ✅ | — | ✅ `get_message_context` |
 | Download media from a message | ✅ | ✅ | ✅ `download_media` |
 | Group info / participants | — | — | ✅ `get_group_info` |
+| Group admin (leave/add/remove/promote/demote/invite/create/rename) | — | — | ✅ `leave_group`, `group_participants`, `get_group_invite`, `update_group`, `create_group` |
+| Edit / delete own message | — | — | ✅ `edit_message`, `delete_message` |
+| Typing / presence | — | — | ✅ `send_typing` |
+| Inbound long-poll | — | ✅ (polling) | ✅ `wait_for_messages` (60 s) |
+| Full history store | ✅ (SQLite) | ✅ | ✅ (SQLite, node:sqlite) |
 | Profile | — | ✅ business profile | ✅ `get_profile` |
 | Connection status | — | — | ✅ `get_status` |
-| **Total tools** | **12** | **35** | **17** |
+| **Total tools** | **12** | **35** | **28** |
 
 ## What the 35-tool server has that we cannot (or should not) match
 
@@ -54,12 +59,9 @@ the right architecture is a separate Cloud-API adapter beside this one — not a
 
 | Gap | Why it matters | Effort |
 |---|---|---|
-| Real-time inbound push (listener/webhook tool) | "Tell me when X messages me" — today we only read on demand | Medium (needs an event queue + a notification sink) |
-| Delivery/read receipts tracking | "Which of my messages failed?" | Medium (bind `messages.update`, persist status) |
-| Edit / delete own messages | Fix a typo sent to the wrong person | Low |
-| Group administration (add/remove/promote) | Managing groups from chat | Medium (Baileys supports it; needs care) |
-| Typing / presence | Human-feeling automation | Low |
-| Contact import beyond sync | Search full address book on first run | Low (request full sync) |
+| Real-time inbound push to an external sink (webhook/notification) | Today `wait_for_messages` long-polls; a push needs a listener host | Medium |
+| Delivery/read receipts tracking | "Which of my messages failed?" — needs `messages.update` binding | Medium |
+| Cloud-API business features (templates, buttons, flows, catalogs) | Not possible on Linked Devices — separate adapter | Large |
 
 ## Our structural advantages (keep these)
 

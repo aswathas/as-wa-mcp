@@ -258,6 +258,154 @@ export function createTools(client: WaClient): ToolDef[] {
         }),
     },
     {
+      name: 'edit_message',
+      description: 'Edit the text of one of your own sent messages.',
+      shape: { chat: chatArg, message_id: z.string().min(1), text: z.string().min(1) },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ chat: z.string(), message_id: z.string().min(1), text: z.string().min(1) }, args);
+          return client.edit(a.chat, a.message_id, a.text);
+        }),
+    },
+    {
+      name: 'delete_message',
+      description: 'Revoke (delete for everyone) one of your own messages.',
+      shape: { chat: chatArg, message_id: z.string().min(1) },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ chat: z.string(), message_id: z.string().min(1) }, args);
+          return client.remove(a.chat, a.message_id);
+        }),
+    },
+    {
+      name: 'send_typing',
+      description: 'Show or clear the typing/recording indicator in a chat.',
+      shape: {
+        chat: chatArg,
+        state: z.enum(['composing', 'paused', 'recording', 'available', 'unavailable']).default('composing'),
+      },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse(
+            { chat: z.string(), state: z.enum(['composing', 'paused', 'recording', 'available', 'unavailable']).default('composing') },
+            args,
+          );
+          return client.presence(a.chat, a.state);
+        }),
+    },
+    {
+      name: 'list_contacts',
+      description: 'List known contacts and chat names (alphabetical).',
+      shape: { limit: limitSchema(50, 5000).describe('Max contacts to return (1-5000).') },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ limit: limitSchema(50, 5000) }, args);
+          return client.listContacts(a.limit);
+        }),
+    },
+    {
+      name: 'get_new_messages',
+      description: 'Messages at or after a timestamp (seconds), oldest first — cursor-style polling.',
+      shape: {
+        since_ts: z.number().int().min(0).describe('Unix timestamp in seconds; 0 returns the cached window.'),
+        limit: limitSchema(50).describe('Max messages (1-200).'),
+        chat: z.string().optional().describe('Restrict to one chat (number or JID).'),
+      },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse(
+            { since_ts: z.number().int().min(0), limit: limitSchema(50), chat: z.string().optional() },
+            args,
+          );
+          return client.newMessages(a.since_ts, a.limit, a.chat);
+        }),
+    },
+    {
+      name: 'wait_for_messages',
+      description:
+        'Long-poll up to 60 s: return as soon as a new message arrives (optionally in one chat). timed_out=true when nothing arrived.',
+      shape: {
+        timeout_s: z.number().int().min(1).max(60).default(30).describe('How long to wait, in seconds (1-60).'),
+        chat: z.string().optional().describe('Only wake for this chat (number or JID).'),
+      },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse(
+            { timeout_s: z.number().int().min(1).max(60).default(30), chat: z.string().optional() },
+            args,
+          );
+          return client.waitForMessages({ timeoutMs: a.timeout_s * 1000, ...(a.chat ? { chat: a.chat } : {}) });
+        }),
+    },
+    {
+      name: 'leave_group',
+      description: 'Leave a group (your account is removed from it).',
+      shape: { chat: chatArg },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ chat: z.string() }, args);
+          return client.leaveGroup(a.chat);
+        }),
+    },
+    {
+      name: 'group_participants',
+      description: 'Add, remove, promote or demote group participants (admin rights required for most actions).',
+      shape: {
+        chat: chatArg,
+        action: z.enum(['add', 'remove', 'promote', 'demote']).describe('What to do with the listed participants.'),
+        phones: z.array(z.string()).min(1).describe('Participant phone numbers (or user JIDs).'),
+      },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse(
+            {
+              chat: z.string(),
+              action: z.enum(['add', 'remove', 'promote', 'demote']),
+              phones: z.array(z.string()).min(1),
+            },
+            args,
+          );
+          return client.groupParticipants(a.chat, a.action, a.phones);
+        }),
+    },
+    {
+      name: 'get_group_invite',
+      description: 'Get the group invite code and link; reset=true revokes it and returns a fresh one.',
+      shape: { chat: chatArg, reset: z.boolean().default(false).describe('Revoke the current code first.') },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ chat: z.string(), reset: z.boolean().default(false) }, args);
+          return client.getGroupInvite(a.chat, a.reset);
+        }),
+    },
+    {
+      name: 'update_group',
+      description: 'Change the group subject and/or description (admin required).',
+      shape: {
+        chat: chatArg,
+        subject: z.string().optional().describe('New group name.'),
+        description: z.string().optional().describe('New group description.'),
+      },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ chat: z.string(), subject: z.string().optional(), description: z.string().optional() }, args);
+          return client.updateGroup(a.chat, { ...(a.subject ? { subject: a.subject } : {}), ...(a.description ? { description: a.description } : {}) });
+        }),
+    },
+    {
+      name: 'create_group',
+      description: 'Create a new group with a subject and initial participants.',
+      shape: {
+        subject: z.string().min(1).describe('Group name.'),
+        phones: z.array(z.string()).min(1).describe('Participant phone numbers (or user JIDs).'),
+      },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ subject: z.string().min(1), phones: z.array(z.string()).min(1) }, args);
+          return client.createGroup(a.subject, a.phones);
+        }),
+    },
+    {
       name: 'get_status',
       description: 'Connection status: paired | pairing | not_paired, uptime, last reconnect.',
       shape: {},

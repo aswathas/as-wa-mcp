@@ -65,13 +65,13 @@ describe('ChatStore search / context / raw cache', () => {
     expect(store.messageContext(JID, 'nope', 1, 1)).toBeUndefined();
   });
 
-  it('keeps raw messages for quoting/download, capped at 200', () => {
+  it('keeps raw messages for quoting/download, capped (default 500)', () => {
     const store = new ChatStore();
     store.ingestMessage(textMsg('M1', 'x', 1));
     expect(store.getRaw('M1')).toBeDefined();
-    for (let i = 0; i < 205; i++) store.ingestMessage(textMsg(`B${i}`, 'y', 2 + i));
+    for (let i = 0; i < 505; i++) store.ingestMessage(textMsg(`B${i}`, 'y', 2 + i));
     expect(store.getRaw('M1')).toBeUndefined();
-    expect(store.getRaw('B204')).toBeDefined();
+    expect(store.getRaw('B504')).toBeDefined();
   });
 
   it('marks media messages with has_media', () => {
@@ -245,6 +245,109 @@ describe('new tools against a connected client', () => {
       error: { code: 'INVALID_ARGUMENT' },
     });
     expect(await tools['send_contact']?.run({ to: '+911234567890', contacts: [] })).toMatchObject({
+      ok: false,
+      error: { code: 'INVALID_ARGUMENT' },
+    });
+  });
+
+  it('edit_message and delete_message send revoke/edit frames', async () => {
+    const { sock, tools } = await ready();
+    expect(await tools['edit_message']?.run({ chat: '+911234567890', message_id: 'M1', text: 'fixed' })).toMatchObject({
+      ok: true,
+      data: { edited: true },
+    });
+    expect(sock.sent[0]?.content).toEqual({
+      edit: { remoteJid: JID, id: 'M1', fromMe: true },
+      text: 'fixed',
+    });
+    expect(await tools['delete_message']?.run({ chat: '+911234567890', message_id: 'M1' })).toMatchObject({
+      ok: true,
+      data: { revoked: true },
+    });
+    expect(sock.sent[1]?.content).toEqual({ delete: { remoteJid: JID, id: 'M1', fromMe: true } });
+  });
+
+  it('send_typing emits a presence update', async () => {
+    const { sock, tools } = await ready();
+    expect(await tools['send_typing']?.run({ chat: '+911234567890' })).toMatchObject({ ok: true, data: { state: 'composing' } });
+    expect(sock.presenceCalls).toEqual([{ state: 'composing', jid: JID }]);
+  });
+
+  it('list_contacts returns known names', async () => {
+    const { tools } = await ready();
+    expect(await tools['list_contacts']?.run({})).toMatchObject({ ok: true, data: [{ name: 'Aswath' }] });
+  });
+
+  it('get_new_messages is a cursor read', async () => {
+    const { tools } = await ready();
+    const env = await tools['get_new_messages']?.run({ since_ts: 150 });
+    expect(env).toMatchObject({ ok: true });
+    expect((env as { data: { id: string }[] }).data.map((m) => m.id)).toEqual(['M2', 'I1']);
+  });
+
+  it('wait_for_messages resolves when a message arrives, and times out cleanly', async () => {
+    const { h, sock, tools } = await ready();
+    const waiting = tools['wait_for_messages']?.run({ timeout_s: 5 });
+    await new Promise((r) => setTimeout(r, 0));
+    sock.emit('messages.upsert', {
+      messages: [textMsg('NEW1', 'ping', 400)],
+      type: 'notify',
+    });
+    expect(await waiting).toMatchObject({ ok: true, data: { timed_out: false } });
+
+    const second = tools['wait_for_messages']?.run({ timeout_s: 5 });
+    await new Promise((r) => setTimeout(r, 0));
+    h.timers.queue.filter((t) => !t.cancelled && t.ms === 5000).forEach((t) => t.fn());
+    expect(await second).toMatchObject({ ok: true, data: { timed_out: true } });
+  });
+
+  it('group admin: leave, participants, invite, update, create', async () => {
+    const { sock, tools } = await ready();
+    expect(await tools['leave_group']?.run({ chat: GROUP })).toMatchObject({ ok: true, data: { left: true } });
+    expect(sock.groupCalls[0]).toEqual({ op: 'leave', target: GROUP });
+
+    expect(
+      await tools['group_participants']?.run({ chat: GROUP, action: 'promote', phones: ['+918888888888'] }),
+    ).toMatchObject({ ok: true, data: { action: 'promote' } });
+    expect(sock.groupCalls[1]).toMatchObject({ op: 'promote', target: GROUP, args: ['918888888888@s.whatsapp.net'] });
+
+    expect(await tools['get_group_invite']?.run({ chat: GROUP })).toMatchObject({
+      ok: true,
+      data: { invite_code: 'INVITECODE', link: 'https://chat.whatsapp.com/INVITECODE' },
+    });
+    expect(await tools['get_group_invite']?.run({ chat: GROUP, reset: true })).toMatchObject({
+      ok: true,
+      data: { invite_code: 'NEWCODE', reset: true },
+    });
+
+    expect(await tools['update_group']?.run({ chat: GROUP, subject: 'New', description: 'Desc' })).toMatchObject({
+      ok: true,
+      data: { subject: 'New', description: 'Desc' },
+    });
+    expect(sock.groupCalls.map((c) => c.op)).toEqual(['leave', 'promote', 'invite', 'revoke', 'subject', 'description']);
+
+    expect(await tools['create_group']?.run({ subject: 'Team', phones: ['+918888888888'] })).toMatchObject({
+      ok: true,
+      data: { subject: 'Team', participant_count: 1 },
+    });
+    expect(sock.groupCalls[6]).toMatchObject({ op: 'create', target: 'Team' });
+  });
+
+  it('group admin rejects non-groups and bad input', async () => {
+    const { tools } = await ready();
+    expect(await tools['leave_group']?.run({ chat: '+911234567890' })).toMatchObject({
+      ok: false,
+      error: { code: 'INVALID_ARGUMENT' },
+    });
+    expect(await tools['group_participants']?.run({ chat: GROUP, action: 'add', phones: [] })).toMatchObject({
+      ok: false,
+      error: { code: 'INVALID_ARGUMENT' },
+    });
+    expect(await tools['group_participants']?.run({ chat: GROUP, action: 'banish', phones: ['+911234567890'] })).toMatchObject({
+      ok: false,
+      error: { code: 'INVALID_ARGUMENT' },
+    });
+    expect(await tools['update_group']?.run({ chat: GROUP })).toMatchObject({
       ok: false,
       error: { code: 'INVALID_ARGUMENT' },
     });

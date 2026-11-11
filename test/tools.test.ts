@@ -37,6 +37,17 @@ describe('tools (not paired)', () => {
       ['mark_read', { chat: '+911234567890' }],
       ['get_group_info', { chat: '120363012345678901@g.us' }],
       ['download_media', { chat: '+911234567890', message_id: 'M1' }],
+      ['edit_message', { chat: '+911234567890', message_id: 'M1', text: 'x' }],
+      ['delete_message', { chat: '+911234567890', message_id: 'M1' }],
+      ['send_typing', { chat: '+911234567890' }],
+      ['list_contacts', {}],
+      ['get_new_messages', { since_ts: 0 }],
+      ['wait_for_messages', { timeout_s: 1 }],
+      ['leave_group', { chat: '120363012345678901@g.us' }],
+      ['group_participants', { chat: '120363012345678901@g.us', action: 'add', phones: ['+911234567890'] }],
+      ['get_group_invite', { chat: '120363012345678901@g.us' }],
+      ['update_group', { chat: '120363012345678901@g.us', subject: 'x' }],
+      ['create_group', { subject: 'x', phones: ['+911234567890'] }],
     ] as const) {
       const env = await tools[name]?.run(args);
       expect(env, name).toMatchObject({ ok: false, data: null, error: { code: 'NOT_PAIRED', hint: 'not paired, run: node dist/cli.js pair' } });
@@ -65,17 +76,25 @@ describe('MCP server over an in-memory transport', () => {
     await Promise.all([server.connect(a), client.connect(b)]);
 
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).toHaveLength(17);
+    expect(tools.map((t) => t.name)).toHaveLength(28);
     expect(tools.map((t) => t.name).sort()).toEqual([
+      'create_group',
+      'delete_message',
       'download_media',
+      'edit_message',
       'get_chat',
       'get_group_info',
+      'get_group_invite',
       'get_last_interaction',
       'get_message_context',
       'get_messages',
+      'get_new_messages',
       'get_profile',
       'get_status',
+      'group_participants',
+      'leave_group',
       'list_chats',
+      'list_contacts',
       'mark_read',
       'react_message',
       'search_contacts',
@@ -84,6 +103,9 @@ describe('MCP server over an in-memory transport', () => {
       'send_location',
       'send_message',
       'send_sticker',
+      'send_typing',
+      'update_group',
+      'wait_for_messages',
     ]);
 
     const res = await client.callTool({ name: 'get_status', arguments: {} });

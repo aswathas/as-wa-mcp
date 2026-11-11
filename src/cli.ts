@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 import path from 'node:path';
 import qrcode from 'qrcode-terminal';
-import { defaultAuthDir, isRegistered, liveRuntime, readMe, STORE_FILE } from './auth.js';
+import { defaultAuthDir, isRegistered, liveRuntime, readMe } from './auth.js';
 import { baileysFactory } from './baileys.js';
 import { WaClient } from './client.js';
 import { WaError, fail, notPairedError, ok } from './errors.js';
 import type { Envelope } from './errors.js';
 import { jidToNumber, normalizeJid } from './jid.js';
-import { ChatStore } from './store.js';
+import { openStore } from './sqlstore.js';
+import type { Store } from './store.js';
 
 const USAGE = `wa-mcp CLI
   pair [--phone <number>]              link WhatsApp (QR in terminal, or pairing code with --phone)
@@ -28,6 +29,17 @@ const USAGE = `wa-mcp CLI
   sticker <to> <path.webp>             send a sticker
   vcard <to> <name> <phone> [email]    send a contact card
   group <chat>                         group metadata (subject, participants)
+  edit <chat> <message_id> <text>      edit one of your own messages
+  del <chat> <message_id>              revoke (delete for everyone) your message
+  typing <chat> [state]                composing|paused|recording|available|unavailable
+  all-contacts [limit]                 list every known contact
+  new [since_ts] [limit] [chat]        messages since a timestamp (0 = cached window)
+  wait [chat] [seconds]                block until a new message arrives (max 60 s)
+  leave <chat>                         leave a group
+  participants <act> <chat> <phone...> act = add|remove|promote|demote
+  invite <chat> [--reset]              group invite code + link (--reset revokes)
+  group-set <chat> [--subject <s>] [--description <d>]   rename/redescribe a group
+  create-group <subject> <phone...>    create a new group
 `;
 
 const log = (msg: string): void => {
@@ -61,7 +73,7 @@ function positiveInt(v: string | undefined, def: number, label: string): number 
   return n;
 }
 
-function makeClient(authDir: string, store = new ChatStore(path.join(authDir, STORE_FILE))): WaClient {
+function makeClient(authDir: string, store: Store = openStore(authDir)): WaClient {
   return new WaClient({ authDir, factory: baileysFactory, store, log: (m) => log(`[wa-mcp] ${m}`) });
 }
 
@@ -149,7 +161,7 @@ async function cmdSync(authDir: string, args: string[]): Promise<Envelope<unknow
   const seconds = positiveInt(args[0], 15, 'seconds');
   if (!isRegistered(authDir)) throw notPairedError();
   refuseIfServerLive(authDir, force);
-  const store = new ChatStore(path.join(authDir, STORE_FILE));
+  const store = openStore(authDir);
   const client = makeClient(authDir, store);
   try {
     await client.start();
@@ -162,17 +174,16 @@ async function cmdSync(authDir: string, args: string[]): Promise<Envelope<unknow
 }
 
 function cmdChats(authDir: string, args: string[]): Envelope<unknown> {
-  if (!isRegistered(authDir)) throw notPairedError();
-  return ok(new ChatStore(path.join(authDir, STORE_FILE)).listChats(positiveInt(args[0], 20, 'limit')));
+  return ok(localStore(authDir).listChats(positiveInt(args[0], 20, 'limit')));
 }
 
 function cmdMessages(authDir: string, args: string[]): Envelope<unknown> {
   return ok(localStore(authDir).getMessages(requireArg(args[0], 'chat'), positiveInt(args[1], 20, 'n')));
 }
 
-function localStore(authDir: string): ChatStore {
+function localStore(authDir: string): Store {
   if (!isRegistered(authDir)) throw notPairedError();
-  return new ChatStore(path.join(authDir, STORE_FILE));
+  return openStore(authDir);
 }
 
 function requireArg(value: string | undefined, label: string): string {
@@ -268,6 +279,91 @@ function cmdGroup(authDir: string, args: string[]): Promise<Envelope<unknown>> {
   return withClient(authDir, false, (c) => c.getGroupInfo(chat));
 }
 
+function cmdEdit(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const chat = requireArg(args[0], 'chat');
+  const messageId = requireArg(args[1], 'message_id');
+  const text = args.slice(2).join(' ');
+  if (!text) throw new WaError('INVALID_ARGUMENT', 'usage: edit <chat> <message_id> <text>');
+  return withClient(authDir, false, (c) => c.edit(chat, messageId, text));
+}
+
+function cmdDelete(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const chat = requireArg(args[0], 'chat');
+  const messageId = requireArg(args[1], 'message_id');
+  return withClient(authDir, false, (c) => c.remove(chat, messageId));
+}
+
+function cmdTyping(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const chat = requireArg(args[0], 'chat');
+  const state = (args[1] ?? 'composing') as 'composing' | 'paused' | 'recording' | 'available' | 'unavailable';
+  return withClient(authDir, false, (c) => c.presence(chat, state));
+}
+
+function cmdAllContacts(authDir: string, args: string[]): Envelope<unknown> {
+  return ok(localStore(authDir).listContacts(positiveInt(args[0], 100, 'limit')));
+}
+
+function cmdNew(authDir: string, args: string[]): Envelope<unknown> {
+  const since = args[0] === undefined ? 0 : Number(args[0]);
+  if (!Number.isFinite(since)) throw new WaError('INVALID_ARGUMENT', 'since_ts must be a number');
+  return ok(
+    localStore(authDir).messagesSince(
+      since,
+      positiveInt(args[1], 50, 'limit'),
+      args[2] ? normalizeJid(args[2]) : undefined,
+    ),
+  );
+}
+
+function cmdWait(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const chat = args[0];
+  const seconds = positiveInt(args[1], 30, 'seconds');
+  if (seconds > 60) throw new WaError('INVALID_ARGUMENT', 'wait is capped at 60 seconds');
+  return withClient(authDir, false, (c) =>
+    c.waitForMessages({ timeoutMs: seconds * 1000, ...(chat ? { chat } : {}) }),
+  );
+}
+
+function cmdLeave(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const chat = requireArg(args[0], 'chat');
+  return withClient(authDir, false, (c) => c.leaveGroup(chat));
+}
+
+function cmdParticipants(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const action = requireArg(args[0], 'action');
+  if (!['add', 'remove', 'promote', 'demote'].includes(action)) {
+    throw new WaError('INVALID_ARGUMENT', 'action must be add|remove|promote|demote');
+  }
+  const chat = requireArg(args[1], 'chat');
+  const phones = args.slice(2);
+  if (phones.length === 0) throw new WaError('INVALID_ARGUMENT', 'usage: participants <action> <chat> <phone...>');
+  return withClient(authDir, false, (c) =>
+    c.groupParticipants(chat, action as 'add' | 'remove' | 'promote' | 'demote', phones),
+  );
+}
+
+function cmdInvite(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const reset = boolFlag(args, '--reset');
+  const chat = requireArg(args[0], 'chat');
+  return withClient(authDir, false, (c) => c.getGroupInvite(chat, reset));
+}
+
+function cmdGroupSet(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const subject = flag(args, '--subject');
+  const description = flag(args, '--description');
+  const chat = requireArg(args[0], 'chat');
+  return withClient(authDir, false, (c) =>
+    c.updateGroup(chat, { ...(subject ? { subject } : {}), ...(description ? { description } : {}) }),
+  );
+}
+
+function cmdCreateGroup(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const subject = requireArg(args[0], 'subject');
+  const phones = args.slice(1);
+  if (phones.length === 0) throw new WaError('INVALID_ARGUMENT', 'usage: create-group <subject> <phone...>');
+  return withClient(authDir, false, (c) => c.createGroup(subject, phones));
+}
+
 async function main(): Promise<number> {
   const [cmd, ...args] = process.argv.slice(2);
   const authDir = defaultAuthDir();
@@ -327,6 +423,39 @@ async function main(): Promise<number> {
         break;
       case 'group':
         env = await cmdGroup(authDir, args);
+        break;
+      case 'edit':
+        env = await cmdEdit(authDir, args);
+        break;
+      case 'del':
+        env = await cmdDelete(authDir, args);
+        break;
+      case 'typing':
+        env = await cmdTyping(authDir, args);
+        break;
+      case 'all-contacts':
+        env = cmdAllContacts(authDir, args);
+        break;
+      case 'new':
+        env = cmdNew(authDir, args);
+        break;
+      case 'wait':
+        env = await cmdWait(authDir, args);
+        break;
+      case 'leave':
+        env = await cmdLeave(authDir, args);
+        break;
+      case 'participants':
+        env = await cmdParticipants(authDir, args);
+        break;
+      case 'invite':
+        env = await cmdInvite(authDir, args);
+        break;
+      case 'group-set':
+        env = await cmdGroupSet(authDir, args);
+        break;
+      case 'create-group':
+        env = await cmdCreateGroup(authDir, args);
         break;
       default:
         process.stdout.write(USAGE);

@@ -17,7 +17,7 @@ import type { SendInput } from './media.js';
 import { DEFAULT_BACKOFF, backoffDelay, initialState, reduce, toStatusReport } from './state.js';
 import type { BackoffOptions, ConnEvent, ConnState, StatusReport } from './state.js';
 import { ChatStore } from './store.js';
-import type { ChatInfo, ChatSummary, ContactHit, MessageHit, StoredMessage } from './store.js';
+import type { ChatInfo, ChatSummary, ContactHit, MessageHit, Store, StoredMessage } from './store.js';
 
 /** The subset of Baileys' socket events this client consumes. */
 export interface SocketEvents {
@@ -40,6 +40,18 @@ export interface WaSocketLike {
   logout(msg?: string): Promise<void>;
   end(error: Error | undefined): void;
   readMessages?(keys: { remoteJid: string; id: string; fromMe?: boolean }[]): Promise<void> | void;
+  sendPresenceUpdate?(type: string, jid?: string): Promise<void> | void;
+  groupLeave?(jid: string): Promise<void> | void;
+  groupParticipantsUpdate?(
+    jid: string,
+    users: string[],
+    action: 'add' | 'remove' | 'promote' | 'demote',
+  ): Promise<{ status?: string; jid?: string }[]>;
+  groupInviteCode?(jid: string): Promise<string | undefined>;
+  groupRevokeInvite?(jid: string): Promise<string | undefined>;
+  groupCreate?(subject: string, participants: string[]): Promise<{ id?: string; subject?: string; participants?: { id?: string }[] }>;
+  groupUpdateSubject?(jid: string, subject: string): Promise<void> | void;
+  groupUpdateDescription?(jid: string, description?: string): Promise<void> | void;
   groupMetadata?(jid: string): Promise<{
     id?: string;
     subject?: string;
@@ -69,7 +81,7 @@ export const realTimers: Timers = {
 export interface ClientOptions {
   authDir: string;
   factory: SocketFactory;
-  store?: ChatStore;
+  store?: Store;
   now?: () => number;
   timers?: Timers;
   backoff?: BackoffOptions;
@@ -125,7 +137,7 @@ export function statusCodeOf(err: unknown): number | undefined {
 
 export class WaClient {
   private readonly bus = new EventEmitter();
-  private readonly store: ChatStore;
+  private readonly store: Store;
   private readonly now: () => number;
   private readonly timers: Timers;
   private readonly backoff: BackoffOptions;
@@ -340,7 +352,9 @@ export class WaClient {
     sock.ev.on(
       'messages.upsert',
       guard('messages.upsert', ({ messages }) => {
-        for (const m of messages) this.safeIngest(m);
+        let added = false;
+        for (const m of messages) added = this.safeIngest(m) || added;
+        if (added) this.bus.emit('message');
         this.scheduleFlush();
       }),
     );
@@ -383,11 +397,12 @@ export class WaClient {
     );
   }
 
-  private safeIngest(m: WAMessage): void {
+  private safeIngest(m: WAMessage): boolean {
     try {
-      this.store.ingestMessage(m);
+      return this.store.ingestMessage(m);
     } catch (err) {
       this.log(`dropping malformed message: ${String(err)}`);
+      return false;
     }
   }
 
@@ -723,6 +738,200 @@ export class WaClient {
     const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
     const buffer = (await downloadMediaMessage(raw as never, 'buffer', {})) as Buffer;
     return { buffer, mimetype: mediaMimetypeOf(raw) ?? 'application/octet-stream' };
+  }
+
+  async listContacts(limit: number): Promise<ContactHit[]> {
+    await this.ensureStarted();
+    this.requirePaired();
+    return this.store.listContacts(limit);
+  }
+
+  async newMessages(sinceTs: number, limit: number, chat?: string): Promise<StoredMessage[]> {
+    await this.ensureStarted();
+    this.requirePaired();
+    return this.store.messagesSince(sinceTs, limit, chat ? normalizeJid(chat) : undefined);
+  }
+
+  /** Long-poll: resolve as soon as a message we have not seen before arrives. */
+  async waitForMessages(opts: { chat?: string; timeoutMs?: number } = {}): Promise<{ messages: StoredMessage[]; timed_out: boolean }> {
+    await this.ensureStarted();
+    this.requirePaired();
+    const chatJid = opts.chat ? normalizeJid(opts.chat) : undefined;
+    const timeoutMs = Math.min(Math.max(opts.timeoutMs ?? 30_000, 1_000), 60_000);
+    const snapshot = (): StoredMessage[] => this.store.messagesSince(0, 2_000, chatJid);
+    const before = new Set(snapshot().map((m) => m.id));
+    const fresh = (): StoredMessage[] => snapshot().filter((m) => !before.has(m.id));
+    return new Promise((resolve) => {
+      let settled = false;
+      let cancel: () => void = () => undefined;
+      const off = this.onMessage(() => {
+        const hits = fresh();
+        if (hits.length > 0) finish({ messages: hits, timed_out: false });
+      });
+      const finish = (r: { messages: StoredMessage[]; timed_out: boolean }): void => {
+        if (settled) return;
+        settled = true;
+        off();
+        cancel();
+        resolve(r);
+      };
+      cancel = this.timers.set(() => finish({ messages: [], timed_out: true }), timeoutMs);
+      const now = fresh();
+      if (now.length > 0) finish({ messages: now, timed_out: false });
+    });
+  }
+
+  onMessage(fn: () => void): () => void {
+    this.bus.on('message', fn);
+    return () => this.bus.off('message', fn);
+  }
+
+  async edit(chat: string, messageId: string, text: string): Promise<{ chat: string; message_id: string; edited: boolean }> {
+    const jid = normalizeJid(chat);
+    const sock = await this.requireReady();
+    const content = { edit: { remoteJid: jid, id: messageId, fromMe: true }, text } as unknown as AnyMessageContent;
+    try {
+      await sock.sendMessage(jid, content);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new WaError('SEND_FAILED', `Edit failed: ${msg}`);
+    }
+    return { chat: jid, message_id: messageId, edited: true };
+  }
+
+  /** Revoke one of your own messages for everyone. */
+  async remove(chat: string, messageId: string): Promise<{ chat: string; message_id: string; revoked: boolean }> {
+    const jid = normalizeJid(chat);
+    const sock = await this.requireReady();
+    const content = { delete: { remoteJid: jid, id: messageId, fromMe: true } } as unknown as AnyMessageContent;
+    try {
+      await sock.sendMessage(jid, content);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new WaError('SEND_FAILED', `Delete failed: ${msg}`);
+    }
+    return { chat: jid, message_id: messageId, revoked: true };
+  }
+
+  async presence(
+    chat: string,
+    state: 'composing' | 'paused' | 'recording' | 'available' | 'unavailable',
+  ): Promise<{ chat: string; state: string }> {
+    const jid = normalizeJid(chat);
+    const sock = await this.requireReady();
+    if (!sock.sendPresenceUpdate) throw new WaError('INVALID_ARGUMENT', 'Presence is not supported on this connection.');
+    await sock.sendPresenceUpdate(state, jid);
+    return { chat: jid, state };
+  }
+
+  private requireGroup(jid: string): string {
+    if (!jid.endsWith('@g.us')) throw new WaError('INVALID_ARGUMENT', `${jid} is not a group (@g.us).`);
+    return jid;
+  }
+
+  async leaveGroup(chat: string): Promise<{ chat: string; left: boolean }> {
+    const jid = this.requireGroup(normalizeJid(chat));
+    const sock = await this.requireReady();
+    if (!sock.groupLeave) throw new WaError('NOT_CONNECTED', 'Group admin is unavailable on this connection.');
+    try {
+      await sock.groupLeave(jid);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new WaError('SEND_FAILED', `Leave failed: ${msg}`);
+    }
+    return { chat: jid, left: true };
+  }
+
+  async groupParticipants(
+    chat: string,
+    action: 'add' | 'remove' | 'promote' | 'demote',
+    phones: string[],
+  ): Promise<{ chat: string; action: string; results: { status?: string; jid?: string }[] }> {
+    const jid = this.requireGroup(normalizeJid(chat));
+    if (phones.length === 0) throw new WaError('INVALID_ARGUMENT', 'phones must contain at least one number.');
+    const targets = phones.map((p) => {
+      const target = normalizeJid(p);
+      if (!target.endsWith('@s.whatsapp.net')) {
+        throw new WaError('INVALID_ARGUMENT', `Participant must be a phone number: ${p}`);
+      }
+      return target;
+    });
+    const sock = await this.requireReady();
+    if (!sock.groupParticipantsUpdate) throw new WaError('NOT_CONNECTED', 'Group admin is unavailable on this connection.');
+    try {
+      const results = await sock.groupParticipantsUpdate(jid, targets, action);
+      return { chat: jid, action, results: results ?? [] };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new WaError('SEND_FAILED', `Group ${action} failed: ${msg}`);
+    }
+  }
+
+  async getGroupInvite(chat: string, reset = false): Promise<{ chat: string; invite_code: string; link: string; reset: boolean }> {
+    const jid = this.requireGroup(normalizeJid(chat));
+    const sock = await this.requireReady();
+    try {
+      const code = reset
+        ? await (sock.groupRevokeInvite
+            ? sock.groupRevokeInvite(jid)
+            : Promise.reject(new WaError('NOT_CONNECTED', 'Invite reset is unavailable on this connection.')))
+        : await (sock.groupInviteCode
+            ? sock.groupInviteCode(jid)
+            : Promise.reject(new WaError('NOT_CONNECTED', 'Invite codes are unavailable on this connection.')));
+      if (!code) throw new WaError('SEND_FAILED', 'WhatsApp returned no invite code (admin rights required).');
+      return { chat: jid, invite_code: code, link: `https://chat.whatsapp.com/${code}`, reset };
+    } catch (err) {
+      if (err instanceof WaError) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new WaError('SEND_FAILED', `Invite failed: ${msg}`);
+    }
+  }
+
+  async updateGroup(
+    chat: string,
+    opts: { subject?: string; description?: string },
+  ): Promise<{ chat: string; subject: string | null; description: string | null }> {
+    const jid = this.requireGroup(normalizeJid(chat));
+    if (!opts.subject && !opts.description) {
+      throw new WaError('INVALID_ARGUMENT', 'Provide subject and/or description.');
+    }
+    const sock = await this.requireReady();
+    try {
+      if (opts.subject) {
+        if (!sock.groupUpdateSubject) throw new WaError('NOT_CONNECTED', 'Group admin is unavailable on this connection.');
+        await sock.groupUpdateSubject(jid, opts.subject);
+      }
+      if (opts.description) {
+        if (!sock.groupUpdateDescription) throw new WaError('NOT_CONNECTED', 'Group admin is unavailable on this connection.');
+        await sock.groupUpdateDescription(jid, opts.description);
+      }
+    } catch (err) {
+      if (err instanceof WaError) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new WaError('SEND_FAILED', `Group update failed: ${msg}`);
+    }
+    return { chat: jid, subject: opts.subject ?? null, description: opts.description ?? null };
+  }
+
+  async createGroup(
+    subject: string,
+    phones: string[],
+  ): Promise<{ id: string | null; subject: string; participant_count: number }> {
+    if (!subject.trim()) throw new WaError('INVALID_ARGUMENT', 'subject must not be empty.');
+    const targets = phones.map((p) => normalizeJid(p));
+    const sock = await this.requireReady();
+    if (!sock.groupCreate) throw new WaError('NOT_CONNECTED', 'Group creation is unavailable on this connection.');
+    try {
+      const meta = await sock.groupCreate(subject, targets);
+      return {
+        id: meta.id ?? null,
+        subject: meta.subject ?? subject,
+        participant_count: meta.participants?.length ?? targets.length,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new WaError('SEND_FAILED', `Group creation failed: ${msg}`);
+    }
   }
 
   async logout(): Promise<void> {

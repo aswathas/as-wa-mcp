@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { defaultAuthDir, STORE_FILE } from './auth.js';
+import { defaultAuthDir } from './auth.js';
 import { baileysFactory } from './baileys.js';
 import { WaClient } from './client.js';
 import { createServer } from './server.js';
-import { ChatStore } from './store.js';
-import path from 'node:path';
+import { openStore } from './sqlstore.js';
 
 // stdout belongs to the MCP protocol; everything diagnostic goes to stderr.
 const log = (msg: string): void => {
@@ -21,7 +20,7 @@ async function main(): Promise<void> {
   const client = new WaClient({
     authDir,
     factory: baileysFactory,
-    store: new ChatStore(path.join(authDir, STORE_FILE)),
+    store: openStore(authDir),
     log,
     publishRuntime: true,
   });

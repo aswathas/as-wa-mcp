@@ -53,10 +53,36 @@ interface Persisted {
 }
 
 /** How many raw messages to keep for quoting and media download. */
-const MAX_RAW = 200;
+const MAX_RAW = Number(process.env['WA_MCP_MAX_RAW'] ?? 500);
 
-const MAX_MESSAGES_PER_CHAT = 300;
-const MAX_CHATS = 1000;
+/** Public surface both store backends implement (JSON cache, SQLite). */
+export interface Store {
+  ingestChats(chats: Chat[]): void;
+  ingestContacts(contacts: Partial<Contact>[]): void;
+  ingestMessage(msg: WAMessage): boolean;
+  putRaw(id: string, msg: unknown): void;
+  getRaw(id: string): unknown;
+  flush(): boolean;
+  listChats(limit: number): ChatSummary[];
+  listContacts(limit: number): ContactHit[];
+  getMessages(chatId: string, limit: number): StoredMessage[];
+  messagesSince(sinceTs: number, limit: number, chatId?: string): StoredMessage[];
+  hasChat(chatId: string): boolean;
+  searchContacts(query: string, limit: number): ContactHit[];
+  searchMessages(query: string, limit: number): MessageHit[];
+  getChatInfo(chatId: string): ChatInfo | undefined;
+  lastInteraction(chatId: string): StoredMessage | undefined;
+  getMessage(chatId: string, messageId: string): StoredMessage | undefined;
+  messageContext(
+    chatId: string,
+    messageId: string,
+    before: number,
+    after: number,
+  ): { messages: StoredMessage[]; index: number } | undefined;
+}
+
+const MAX_MESSAGES_PER_CHAT = Number(process.env['WA_MCP_MAX_PER_CHAT'] ?? 5000);
+const MAX_CHATS = Number(process.env['WA_MCP_MAX_CHATS'] ?? 2000);
 
 function toSeconds(ts: unknown): number | null {
   if (typeof ts === 'number') return ts;
@@ -88,7 +114,7 @@ export function describeMessage(msg: WAMessage): { type: string; text: string } 
 }
 
 /** In-memory chat + message store, persisted to a JSON file (Baileys v7 ships no store). */
-export class ChatStore {
+export class ChatStore implements Store {
   private chats = new Map<string, ChatEntry>();
   private messages = new Map<string, StoredMessage[]>();
   private names = new Map<string, string>();
@@ -305,6 +331,26 @@ export class ChatStore {
 
   getMessage(chatId: string, messageId: string): StoredMessage | undefined {
     return (this.messages.get(chatId) ?? []).find((m) => m.id === messageId);
+  }
+
+  /** Messages at or after `sinceTs` (seconds), oldest first; optionally one chat. */
+  messagesSince(sinceTs: number, limit: number, chatId?: string): StoredMessage[] {
+    const out: StoredMessage[] = [];
+    for (const [chat, list] of this.messages) {
+      if (chatId && chat !== chatId) continue;
+      for (const m of list) if (m.ts >= sinceTs) out.push(m);
+    }
+    out.sort((a, b) => a.ts - b.ts);
+    return out.slice(0, limit);
+  }
+
+  /** Every known contact/chat, alphabetical (for full contact listing). */
+  listContacts(limit: number): ContactHit[] {
+    const ids = new Set<string>([...this.names.keys(), ...this.chats.keys()]);
+    return [...ids]
+      .map((id) => ({ id, name: this.nameOf(id), number: jidToNumber(id) ?? null }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .slice(0, limit);
   }
 
   /** Window of messages around `messageId` (inclusive), plus its index in the window. */
