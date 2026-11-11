@@ -5,8 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 
 const cfg = JSON.parse(readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8'));
-const entry = cfg.mcpServers['wa'];
-console.log('config entry:', JSON.stringify(entry));
+const name = ['as-wa-mcp', 'wa', 'whatsapp-code'].find((n) => cfg.mcpServers[n]);
+if (!name) {
+  console.log('no wa-mcp entry in ~/.claude.json mcpServers');
+  process.exit(1);
+}
+const entry = cfg.mcpServers[name];
+console.log('config entry (' + name + '):', JSON.stringify(entry));
 
 const b = spawn(entry.command, entry.args, { stdio: ['pipe', 'pipe', 'pipe'] });
 let buf = '';

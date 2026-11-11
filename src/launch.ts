@@ -16,6 +16,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { DEFAULT_PORT } from './http.js';
+import { defaultAuthDir, liveRuntime } from './auth.js';
 
 const log = (msg: string): void => {
   process.stderr.write('[wa-mcp-launch] ' + msg + String.fromCharCode(10));
@@ -56,7 +57,25 @@ async function ensureDaemon(): Promise<void> {
       return;
     }
   }
+  const holder = sessionHolder(authDir ?? defaultAuthDir());
+  if (holder !== undefined) {
+    throw new Error(
+      'another wa-mcp server (pid ' + holder + ') holds this WhatsApp session, ' +
+        'so the shared daemon cannot start. Stop that server first (wa-mcp stop, ' +
+        'or close the agent that runs it).',
+    );
+  }
   throw new Error('wa-mcp daemon did not become healthy on ' + base);
+}
+
+/**
+ * A stdio server holding the session blocks the daemon from starting, because
+ * WhatsApp allows one live connection per linked device. Say so plainly
+ * instead of a bare health-check timeout.
+ */
+function sessionHolder(authDir: string): number | undefined {
+  const holder = liveRuntime(authDir);
+  return holder ? holder.pid : undefined;
 }
 
 async function main(): Promise<void> {

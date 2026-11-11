@@ -104,6 +104,8 @@ node dist/cli.js stop                 # stop the running daemon
 - The daemon exits after `--idle-ms` with **no** connected clients, so closing the last agent stops it. With `WA_MCP_WEBHOOK_URL` set it stays up (live inbound listener).
 - A client that dies without a clean shutdown is dropped after `--stale-ms` of silence.
 
+> Point **every** agent at `dist/launch.js`. An agent that runs `dist/mcp.js` or `dist/codemode.js` directly takes the WhatsApp session itself, and the daemon then refuses to start — that is the "two agents fighting" case. The bridge says so by name when it happens.
+
 ## Tool reference
 
 All tools return `{ "ok": true, "data": …, "error": null }` or `{ "ok": false, "data": null, "error": { "code", "message", "hint?" } }`.

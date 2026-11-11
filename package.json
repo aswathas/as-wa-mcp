@@ -39,7 +39,8 @@
   },
   "bin": {
     "wa-mcp": "dist/cli.js",
-    "wa-mcp-server": "dist/mcp.js"
+    "wa-mcp-server": "dist/mcp.js",
+    "wa-mcp-http": "dist/http.js"
   },
   "engines": {
     "node": ">=24"

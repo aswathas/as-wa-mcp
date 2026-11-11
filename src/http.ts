@@ -207,7 +207,16 @@ export async function startHttpServer(opts: HttpOptions): Promise<void> {
     await transport.handleRequest(req, res, body);
   }
 
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', (err: NodeJS.ErrnoException) => {
+      // Two agents starting at once can race to spawn the daemon. The loser
+      // exits quietly; the winner keeps serving.
+      if (err.code === 'EADDRINUSE') {
+        log('port ' + opts.port + ' is already in use, another daemon is serving it');
+        process.exit(0);
+      }
+      reject(err);
+    });
     server.listen(opts.port, '127.0.0.1', () => {
       resolve();
     });
