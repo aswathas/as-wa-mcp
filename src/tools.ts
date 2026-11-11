@@ -11,7 +11,8 @@ export interface ToolDef {
   run(args: Record<string, unknown>): Promise<Envelope<unknown>>;
 }
 
-const limitSchema = (def: number) => z.number().int().min(1).max(200).default(def);
+const limitSchema = (def: number, max = 200) => z.number().int().min(1).max(max).default(def);
+const chatArg = z.string().describe('Chat: phone number like +911234567890, or a JID (…@s.whatsapp.net, …@g.us).');
 
 function parse<S extends z.ZodRawShape>(shape: S, args: Record<string, unknown>): z.infer<z.ZodObject<S>> {
   const res = z.object(shape).safeParse(args);
@@ -28,27 +29,116 @@ export function createTools(client: WaClient): ToolDef[] {
     text: z.string().optional().describe('Message text. Required unless media_path is given; used as caption if no caption.'),
     media_path: z.string().optional().describe('Absolute path to a local image/video/audio/document to send.'),
     caption: z.string().optional().describe('Caption for image/video/document (audio sends it as a follow-up text).'),
+    reply_to: z.string().optional().describe('Message id to quote as a reply (must be in the recent-message cache).'),
   };
   const chatsShape = { limit: limitSchema(20).describe('Max chats to return (1-200).') };
   const messagesShape = {
-    chat: z.string().describe('Chat: phone number like +911234567890, or a JID.'),
+    chat: chatArg,
     limit: limitSchema(20).describe('Max messages to return, newest last (1-200).'),
+  };
+  const searchShape = {
+    query: z.string().min(1).describe('Case-insensitive substring to search for.'),
+    limit: limitSchema(20).describe('Max results (1-200).'),
+  };
+  const reactionShape = {
+    chat: chatArg,
+    message_id: z.string().min(1).describe('Id of the message to react to.'),
+    emoji: z.string().describe('Emoji to react with (empty string removes the reaction).'),
+  };
+  const contactShape = {
+    to: z.string().describe('Recipient phone number or JID.'),
+    contacts: z
+      .array(z.object({ name: z.string(), phone: z.string(), email: z.string().optional() }))
+      .min(1)
+      .describe('Contact cards to send.'),
   };
 
   return [
     {
       name: 'send_message',
       description:
-        'Send a WhatsApp text or media message (image/video/audio/document). Returns {ok,data,error}. If not paired: run `node dist/cli.js pair`.',
+        'Send a WhatsApp text or media message (image/video/audio/document). Optionally quote a message with reply_to. Returns {ok,data,error}. If not paired: run `node dist/cli.js pair`.',
       shape: sendShape,
       run: (args) =>
         toEnvelope(async () => {
           const a = parse(sendShape, args);
-          const input: { text?: string; mediaPath?: string; caption?: string } = {};
+          const input: { text?: string; mediaPath?: string; caption?: string; replyTo?: string } = {};
           if (a.text !== undefined) input.text = a.text;
           if (a.media_path !== undefined) input.mediaPath = a.media_path;
           if (a.caption !== undefined) input.caption = a.caption;
+          if (a.reply_to !== undefined) input.replyTo = a.reply_to;
           return client.send(a.to, input);
+        }),
+    },
+    {
+      name: 'send_location',
+      description: 'Send a location pin (latitude, longitude, optional name and address).',
+      shape: {
+        to: z.string().describe('Recipient phone number or JID.'),
+        latitude: z.number().min(-90).max(90),
+        longitude: z.number().min(-180).max(180),
+        name: z.string().optional().describe('Place name shown in the pin.'),
+        address: z.string().optional().describe('Address text.'),
+      },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse(
+            {
+              to: z.string(),
+              latitude: z.number().min(-90).max(90),
+              longitude: z.number().min(-180).max(180),
+              name: z.string().optional(),
+              address: z.string().optional(),
+            },
+            args,
+          );
+          return client.sendLocation(a.to, a.latitude, a.longitude, a.name, a.address);
+        }),
+    },
+    {
+      name: 'send_contact',
+      description: 'Send one or more contact cards (name, phone, optional email).',
+      shape: contactShape,
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse(contactShape, args);
+          return client.sendContact(a.to, a.contacts);
+        }),
+    },
+    {
+      name: 'send_sticker',
+      description: 'Send a sticker from a local .webp file.',
+      shape: {
+        to: z.string().describe('Recipient phone number or JID.'),
+        media_path: z.string().describe('Absolute path to a .webp sticker.'),
+      },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ to: z.string(), media_path: z.string() }, args);
+          return client.sendSticker(a.to, a.media_path);
+        }),
+    },
+    {
+      name: 'react_message',
+      description: 'React to a message with an emoji (empty string removes the reaction).',
+      shape: reactionShape,
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse(reactionShape, args);
+          return client.react(a.chat, a.message_id, a.emoji);
+        }),
+    },
+    {
+      name: 'mark_read',
+      description: 'Mark a chat as read (or a single message with message_id).',
+      shape: {
+        chat: chatArg,
+        message_id: z.string().optional().describe('Specific message to mark read; omit for the recent unread window.'),
+      },
+      run: (args) =>
+        toEnvelope(() => {
+          const a = parse({ chat: z.string(), message_id: z.string().optional() }, args);
+          return client.markRead(a.chat, a.message_id);
         }),
     },
     {
@@ -61,6 +151,26 @@ export function createTools(client: WaClient): ToolDef[] {
       }),
     },
     {
+      name: 'search_contacts',
+      description: 'Search contacts and chat names by name or phone number.',
+      shape: searchShape,
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse(searchShape, args);
+          return client.searchContacts(a.query, a.limit);
+        }),
+    },
+    {
+      name: 'search_messages',
+      description: 'Full-text search across cached messages, newest first.',
+      shape: searchShape,
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse(searchShape, args);
+          return client.searchMessages(a.query, a.limit);
+        }),
+    },
+    {
       name: 'list_chats',
       description: 'List recent chats (id, name, last message timestamp), newest first.',
       shape: chatsShape,
@@ -71,6 +181,16 @@ export function createTools(client: WaClient): ToolDef[] {
         }),
     },
     {
+      name: 'get_chat',
+      description: 'Metadata for one chat: name, group flag, last timestamp, unread, cached message count.',
+      shape: { chat: chatArg },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ chat: z.string() }, args);
+          return client.getChat(a.chat);
+        }),
+    },
+    {
       name: 'get_messages',
       description: 'Get recent messages in a chat (oldest first within the returned window).',
       shape: messagesShape,
@@ -78,6 +198,63 @@ export function createTools(client: WaClient): ToolDef[] {
         toEnvelope(async () => {
           const a = parse(messagesShape, args);
           return client.getMessages(a.chat, a.limit);
+        }),
+    },
+    {
+      name: 'get_last_interaction',
+      description: 'Most recent cached message exchanged with a contact or group.',
+      shape: { chat: chatArg },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ chat: z.string() }, args);
+          return client.lastInteraction(a.chat);
+        }),
+    },
+    {
+      name: 'get_message_context',
+      description: 'Window of messages around one message id (before/after), for replying in context.',
+      shape: {
+        chat: chatArg,
+        message_id: z.string().min(1).describe('Message id to centre on.'),
+        before: limitSchema(3, 50).describe('Messages before it (0-50).'),
+        after: limitSchema(3, 50).describe('Messages after it (0-50).'),
+      },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse(
+            {
+              chat: z.string(),
+              message_id: z.string().min(1),
+              before: limitSchema(3, 50),
+              after: limitSchema(3, 50),
+            },
+            args,
+          );
+          return client.messageContext(a.chat, a.message_id, a.before, a.after);
+        }),
+    },
+    {
+      name: 'get_group_info',
+      description: 'Group metadata: subject, owner, description, creation time, participants.',
+      shape: { chat: chatArg },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ chat: z.string() }, args);
+          return client.getGroupInfo(a.chat);
+        }),
+    },
+    {
+      name: 'download_media',
+      description: 'Download media from a recent message to local disk and return the file path.',
+      shape: {
+        chat: chatArg,
+        message_id: z.string().min(1).describe('Id of the message whose media to download.'),
+        save_dir: z.string().optional().describe('Directory to write into (default: <auth>/media).'),
+      },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ chat: z.string(), message_id: z.string().min(1), save_dir: z.string().optional() }, args);
+          return client.downloadMedia(a.chat, a.message_id, a.save_dir);
         }),
     },
     {

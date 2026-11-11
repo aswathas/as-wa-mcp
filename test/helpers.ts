@@ -39,6 +39,16 @@ export class FakeSocket implements WaSocketLike {
     this.pairingRequests.push(phone);
     return 'ABCD-1234';
   }
+  readCalls: { remoteJid: string; id: string; fromMe?: boolean }[][] = [];
+  async readMessages(keys: { remoteJid: string; id: string; fromMe?: boolean }[]): Promise<void> {
+    this.readCalls.push(keys);
+  }
+  groups: Record<string, { id?: string; subject?: string; owner?: string; desc?: string; creation?: number; participants?: { id?: string; admin?: string | null }[] }> = {};
+  async groupMetadata(jid: string) {
+    const g = this.groups[jid];
+    if (!g) throw new Error(`no group metadata for ${jid}`);
+    return g;
+  }
   async logout(): Promise<void> {}
   end(): void {
     this.ended = true;

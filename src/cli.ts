@@ -12,10 +12,22 @@ import { ChatStore } from './store.js';
 const USAGE = `wa-mcp CLI
   pair [--phone <number>]              link WhatsApp (QR in terminal, or pairing code with --phone)
   status                               paired | pairing | not_paired (+ live server info)
-  send <number> <text> [--media <path>] [--caption <text>] [--force]
+  send <number> <text> [--media <path>] [--caption <text>] [--reply-to <id>] [--force]
   sync [seconds]                       connect briefly to refresh the local chat/message cache
   chats [limit]                        recent chats (from local cache)
   messages <chat> [n]                  recent messages in a chat (from local cache)
+  contacts <query> [limit]             search contacts by name or number
+  search <query> [limit]               full-text search across cached messages
+  chat <id>                            metadata for one chat
+  last <chat>                          most recent message with a contact/group
+  context <chat> <message_id> [before] [after]   messages around one id
+  react <chat> <message_id> [emoji]    react to a message (default 👍)
+  read <chat> [message_id]             mark a chat or message as read
+  download <chat> <message_id> [dir]   download media from a recent message
+  loc <to> <lat> <lng> [name] [address]          send a location pin
+  sticker <to> <path.webp>             send a sticker
+  vcard <to> <name> <phone> [email]    send a contact card
+  group <chat>                         group metadata (subject, participants)
 `;
 
 const log = (msg: string): void => {
@@ -112,18 +124,20 @@ async function cmdSend(authDir: string, args: string[]): Promise<Envelope<unknow
   const force = boolFlag(args, '--force');
   const media = flag(args, '--media');
   const caption = flag(args, '--caption');
+  const replyTo = flag(args, '--reply-to');
   const [to, ...rest] = args;
   const text = rest.join(' ');
-  if (!to || (!text && !media)) throw new WaError('INVALID_ARGUMENT', 'usage: send <number> <text> [--media <path>] [--caption <text>]');
+  if (!to || (!text && !media)) throw new WaError('INVALID_ARGUMENT', 'usage: send <number> <text> [--media <path>] [--caption <text>] [--reply-to <id>]');
   if (!isRegistered(authDir)) throw notPairedError();
   refuseIfServerLive(authDir, force);
   const client = makeClient(authDir);
   try {
     await client.start();
-    const input: { text?: string; mediaPath?: string; caption?: string } = {};
+    const input: { text?: string; mediaPath?: string; caption?: string; replyTo?: string } = {};
     if (text) input.text = text;
     if (media) input.mediaPath = path.resolve(media);
     if (caption) input.caption = caption;
+    if (replyTo) input.replyTo = replyTo;
     return ok(await client.send(to, input));
   } finally {
     await client.stop();
@@ -153,10 +167,105 @@ function cmdChats(authDir: string, args: string[]): Envelope<unknown> {
 }
 
 function cmdMessages(authDir: string, args: string[]): Envelope<unknown> {
+  return ok(localStore(authDir).getMessages(requireArg(args[0], 'chat'), positiveInt(args[1], 20, 'n')));
+}
+
+function localStore(authDir: string): ChatStore {
   if (!isRegistered(authDir)) throw notPairedError();
-  const chat = args[0];
-  if (!chat) throw new WaError('INVALID_ARGUMENT', 'usage: messages <chat> [n]');
-  return ok(new ChatStore(path.join(authDir, STORE_FILE)).getMessages(normalizeJid(chat), positiveInt(args[1], 20, 'n')));
+  return new ChatStore(path.join(authDir, STORE_FILE));
+}
+
+function requireArg(value: string | undefined, label: string): string {
+  if (!value) throw new WaError('INVALID_ARGUMENT', `missing ${label}`);
+  return value;
+}
+
+async function withClient(authDir: string, force: boolean, fn: (c: WaClient) => Promise<unknown>): Promise<Envelope<unknown>> {
+  if (!isRegistered(authDir)) throw notPairedError();
+  refuseIfServerLive(authDir, force);
+  const client = makeClient(authDir);
+  try {
+    await client.start();
+    return ok(await fn(client));
+  } finally {
+    await client.stop();
+  }
+}
+
+function cmdContacts(authDir: string, args: string[]): Envelope<unknown> {
+  return ok(localStore(authDir).searchContacts(requireArg(args[0], 'query'), positiveInt(args[1], 20, 'limit')));
+}
+
+function cmdSearch(authDir: string, args: string[]): Envelope<unknown> {
+  return ok(localStore(authDir).searchMessages(requireArg(args[0], 'query'), positiveInt(args[1], 20, 'limit')));
+}
+
+function cmdChat(authDir: string, args: string[]): Envelope<unknown> {
+  const id = normalizeJid(requireArg(args[0], 'chat'));
+  const info = localStore(authDir).getChatInfo(id);
+  if (!info) throw new WaError('INVALID_ARGUMENT', `no cached chat ${id}`);
+  return ok(info);
+}
+
+function cmdLast(authDir: string, args: string[]): Envelope<unknown> {
+  const id = normalizeJid(requireArg(args[0], 'chat'));
+  return ok(localStore(authDir).lastInteraction(id) ?? null);
+}
+
+function cmdContext(authDir: string, args: string[]): Envelope<unknown> {
+  const id = normalizeJid(requireArg(args[0], 'chat'));
+  const ctx = localStore(authDir).messageContext(
+    id,
+    requireArg(args[1], 'message_id'),
+    positiveInt(args[2], 3, 'before'),
+    positiveInt(args[3], 3, 'after'),
+  );
+  if (!ctx) throw new WaError('INVALID_ARGUMENT', 'message not found in the cache');
+  return ok(ctx);
+}
+
+function cmdReact(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const chat = requireArg(args[0], 'chat');
+  const messageId = requireArg(args[1], 'message_id');
+  const emoji = args[2] ?? '👍';
+  return withClient(authDir, false, (c) => c.react(chat, messageId, emoji));
+}
+
+function cmdRead(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const chat = requireArg(args[0], 'chat');
+  return withClient(authDir, false, (c) => c.markRead(chat, args[1]));
+}
+
+function cmdDownload(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const chat = requireArg(args[0], 'chat');
+  const messageId = requireArg(args[1], 'message_id');
+  return withClient(authDir, false, (c) => c.downloadMedia(chat, messageId, args[2]));
+}
+
+function cmdLocation(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const to = requireArg(args[0], 'to');
+  const lat = Number(requireArg(args[1], 'latitude'));
+  const lng = Number(requireArg(args[2], 'longitude'));
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) throw new WaError('INVALID_ARGUMENT', 'latitude/longitude must be numbers');
+  return withClient(authDir, false, (c) => c.sendLocation(to, lat, lng, args[3], args[4]));
+}
+
+function cmdSticker(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const to = requireArg(args[0], 'to');
+  const file = requireArg(args[1], 'path');
+  return withClient(authDir, false, (c) => c.sendSticker(to, path.resolve(file)));
+}
+
+function cmdVcard(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const to = requireArg(args[0], 'to');
+  const name = requireArg(args[1], 'name');
+  const phone = requireArg(args[2], 'phone');
+  return withClient(authDir, false, (c) => c.sendContact(to, [{ name, phone, email: args[3] }]));
+}
+
+function cmdGroup(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const chat = requireArg(args[0], 'chat');
+  return withClient(authDir, false, (c) => c.getGroupInfo(chat));
 }
 
 async function main(): Promise<number> {
@@ -182,6 +291,42 @@ async function main(): Promise<number> {
         break;
       case 'messages':
         env = cmdMessages(authDir, args);
+        break;
+      case 'contacts':
+        env = cmdContacts(authDir, args);
+        break;
+      case 'search':
+        env = cmdSearch(authDir, args);
+        break;
+      case 'chat':
+        env = cmdChat(authDir, args);
+        break;
+      case 'last':
+        env = cmdLast(authDir, args);
+        break;
+      case 'context':
+        env = cmdContext(authDir, args);
+        break;
+      case 'react':
+        env = await cmdReact(authDir, args);
+        break;
+      case 'read':
+        env = await cmdRead(authDir, args);
+        break;
+      case 'download':
+        env = await cmdDownload(authDir, args);
+        break;
+      case 'loc':
+        env = await cmdLocation(authDir, args);
+        break;
+      case 'sticker':
+        env = await cmdSticker(authDir, args);
+        break;
+      case 'vcard':
+        env = await cmdVcard(authDir, args);
+        break;
+      case 'group':
+        env = await cmdGroup(authDir, args);
         break;
       default:
         process.stdout.write(USAGE);

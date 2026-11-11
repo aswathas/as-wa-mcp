@@ -52,6 +52,8 @@ export interface SendInput {
   text?: string;
   mediaPath?: string;
   caption?: string;
+  /** Message id to quote (must still be in the local raw cache). */
+  replyTo?: string;
 }
 
 /**
@@ -104,4 +106,75 @@ export async function assertMediaReadable(mediaPath: string): Promise<void> {
   if (info.size > MAX_MEDIA_BYTES) {
     throw new WaError('MEDIA_TOO_LARGE', `media_path exceeds ${MAX_MEDIA_BYTES / 1024 / 1024} MB: ${mediaPath}`);
   }
+}
+
+/** Sticker content. WhatsApp only accepts .webp stickers. */
+export function buildStickerContent(filePath: string): AnyMessageContent {
+  if (path.extname(filePath).toLowerCase() !== '.webp') {
+    throw new WaError('INVALID_ARGUMENT', 'Stickers must be .webp files (WhatsApp requires webp).');
+  }
+  return { sticker: { url: filePath } };
+}
+
+/** vCard 3.0 text for send_contact. */
+export function buildVcard(name: string, phone: string, email?: string): string {
+  const digits = phone.replace(/[^\d+]/g, '');
+  const waid = digits.replace(/^\+/, '');
+  const lines = [
+    'BEGIN:VCARD',
+    'VERSION:3.0',
+    `FN:${name}`,
+    `TEL;type=CELL;type=VOICE;waid=${waid}:${digits}`,
+  ];
+  if (email) lines.push(`EMAIL:${email}`);
+  lines.push('END:VCARD');
+  return lines.join('\n');
+}
+
+const MIME_EXT: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'video/mp4': 'mp4',
+  'video/3gpp': '3gp',
+  'video/quicktime': 'mov',
+  'video/webm': 'webm',
+  'audio/mpeg': 'mp3',
+  'audio/mp4': 'm4a',
+  'audio/aac': 'aac',
+  'audio/amr': 'amr',
+  'audio/ogg': 'ogg',
+  'application/pdf': 'pdf',
+  'application/zip': 'zip',
+  'text/plain': 'txt',
+  'text/csv': 'csv',
+  'application/json': 'json',
+};
+
+/** Best-effort file extension for a mimetype (downloads). */
+export function extForMime(mime: string): string {
+  const base = mime.split(';')[0]?.trim().toLowerCase() ?? '';
+  return MIME_EXT[base] ?? 'bin';
+}
+
+const MEDIA_NODES = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'];
+const WRAPPERS = ['ephemeralMessage', 'viewOnceMessage', 'viewOnceMessageV2', 'documentWithCaptionMessage'];
+
+/** Pull the media mimetype out of a raw WAMessage (handles wrapper messages). */
+export function mediaMimetypeOf(raw: unknown): string | undefined {
+  const message = (raw as { message?: Record<string, unknown> } | undefined)?.message;
+  if (!message) return undefined;
+  for (const node of MEDIA_NODES) {
+    const part = message[node] as { mimetype?: unknown } | undefined;
+    if (part && typeof part.mimetype === 'string') return part.mimetype;
+  }
+  for (const wrapper of WRAPPERS) {
+    const inner = (message[wrapper] as { message?: unknown } | undefined)?.message;
+    if (inner) {
+      const hit = mediaMimetypeOf({ message: inner });
+      if (hit) return hit;
+    }
+  }
+  return undefined;
 }

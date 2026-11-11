@@ -1,14 +1,23 @@
 import { EventEmitter } from 'node:events';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import type { AnyMessageContent, Chat, ChatUpdate, ConnectionState, Contact, WAMessage } from '@whiskeysockets/baileys';
 import { clearSession, isRegistered, readMe, removeRuntime, writeRuntime } from './auth.js';
 import { WaError, notPairedError } from './errors.js';
 import { normalizeJid, jidToNumber, normalizePhoneDigits } from './jid.js';
-import { assertMediaReadable, buildSendPayloads } from './media.js';
+import {
+  assertMediaReadable,
+  buildSendPayloads,
+  buildStickerContent,
+  buildVcard,
+  extForMime,
+  mediaMimetypeOf,
+} from './media.js';
 import type { SendInput } from './media.js';
 import { DEFAULT_BACKOFF, backoffDelay, initialState, reduce, toStatusReport } from './state.js';
 import type { BackoffOptions, ConnEvent, ConnState, StatusReport } from './state.js';
 import { ChatStore } from './store.js';
-import type { ChatSummary, StoredMessage } from './store.js';
+import type { ChatInfo, ChatSummary, ContactHit, MessageHit, StoredMessage } from './store.js';
 
 /** The subset of Baileys' socket events this client consumes. */
 export interface SocketEvents {
@@ -30,7 +39,19 @@ export interface WaSocketLike {
   requestPairingCode(phone: string): Promise<string>;
   logout(msg?: string): Promise<void>;
   end(error: Error | undefined): void;
+  readMessages?(keys: { remoteJid: string; id: string; fromMe?: boolean }[]): Promise<void> | void;
+  groupMetadata?(jid: string): Promise<{
+    id?: string;
+    subject?: string;
+    owner?: string;
+    desc?: string;
+    creation?: number;
+    participants?: { id?: string; admin?: string | null }[];
+  }>;
 }
+
+/** Injected in tests; the default lazy-loads Baileys' downloader. */
+export type MediaDownloader = (raw: unknown) => Promise<{ buffer: Buffer; mimetype: string }>;
 
 export type SocketFactory = (ctx: { authDir: string }) => Promise<{ sock: WaSocketLike; saveCreds: () => Promise<void> }>;
 
@@ -58,6 +79,8 @@ export interface ClientOptions {
   connectWaitMs?: number;
   /** Publish runtime.json so the CLI can see a live server. */
   publishRuntime?: boolean;
+  /** Override media download (tests). */
+  downloader?: MediaDownloader;
 }
 
 export interface StartOptions {
@@ -474,9 +497,22 @@ export class WaClient {
     const jid = normalizeJid(to);
     const payloads = buildSendPayloads(input);
     if (input.mediaPath) await assertMediaReadable(input.mediaPath);
+    let quoted: unknown;
+    if (input.replyTo) {
+      quoted = this.store.getRaw(input.replyTo);
+      if (!quoted) {
+        throw new WaError(
+          'INVALID_ARGUMENT',
+          `reply_to ${input.replyTo} is not in the local cache; only recent messages can be quoted.`,
+        );
+      }
+    }
     const sock = await this.requireReady();
     const ids: string[] = [];
-    for (const content of payloads) {
+    for (const base of payloads) {
+      const content = quoted
+        ? (Object.assign({}, base, { quoted }) as unknown as AnyMessageContent)
+        : base;
       let sent: WAMessage | undefined;
       try {
         sent = await sock.sendMessage(jid, content);
@@ -515,6 +551,178 @@ export class WaClient {
     await this.ensureStarted();
     this.requirePaired();
     return this.store.getMessages(normalizeJid(chat), limit);
+  }
+
+  async searchContacts(query: string, limit: number): Promise<ContactHit[]> {
+    await this.ensureStarted();
+    this.requirePaired();
+    return this.store.searchContacts(query, limit);
+  }
+
+  async searchMessages(query: string, limit: number): Promise<MessageHit[]> {
+    await this.ensureStarted();
+    this.requirePaired();
+    return this.store.searchMessages(query, limit);
+  }
+
+  async getChat(chat: string): Promise<ChatInfo> {
+    await this.ensureStarted();
+    this.requirePaired();
+    const jid = normalizeJid(chat);
+    const info = this.store.getChatInfo(jid);
+    if (!info) throw new WaError('INVALID_ARGUMENT', `No cached chat ${jid}. Run sync, or use list_chats.`);
+    return info;
+  }
+
+  async lastInteraction(chat: string): Promise<StoredMessage | null> {
+    await this.ensureStarted();
+    this.requirePaired();
+    return this.store.lastInteraction(normalizeJid(chat)) ?? null;
+  }
+
+  async messageContext(
+    chat: string,
+    messageId: string,
+    before: number,
+    after: number,
+  ): Promise<{ messages: StoredMessage[]; index: number }> {
+    await this.ensureStarted();
+    this.requirePaired();
+    const jid = normalizeJid(chat);
+    const ctx = this.store.messageContext(jid, messageId, before, after);
+    if (!ctx) {
+      throw new WaError('INVALID_ARGUMENT', `Message ${messageId} not found in ${jid} (the cache holds recent history only).`);
+    }
+    return ctx;
+  }
+
+  async react(chat: string, messageId: string, emoji: string): Promise<{ chat: string; message_id: string; emoji: string }> {
+    const jid = normalizeJid(chat);
+    const sock = await this.requireReady();
+    try {
+      await sock.sendMessage(jid, { react: { text: emoji, key: { remoteJid: jid, id: messageId, fromMe: false } } });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new WaError('SEND_FAILED', `Reaction failed: ${msg}`);
+    }
+    return { chat: jid, message_id: messageId, emoji };
+  }
+
+  async markRead(chat: string, messageId?: string): Promise<{ chat: string; marked: number }> {
+    const jid = normalizeJid(chat);
+    const sock = await this.requireReady();
+    if (!sock.readMessages) throw new WaError('INVALID_ARGUMENT', 'This connection cannot send read receipts.');
+    const ids = messageId ? [messageId] : this.store.getMessages(jid, 50).filter((m) => !m.fromMe).map((m) => m.id);
+    if (ids.length === 0) return { chat: jid, marked: 0 };
+    await sock.readMessages(ids.map((id) => ({ remoteJid: jid, id, fromMe: false })));
+    return { chat: jid, marked: ids.length };
+  }
+
+  async sendLocation(
+    to: string,
+    latitude: number,
+    longitude: number,
+    name?: string,
+    address?: string,
+  ): Promise<{ to: string; latitude: number; longitude: number; name: string | null; address: string | null }> {
+    const jid = normalizeJid(to);
+    const sock = await this.requireReady();
+    const content: AnyMessageContent = {
+      location: {
+        degreesLatitude: latitude,
+        degreesLongitude: longitude,
+        ...(name ? { name } : {}),
+        ...(address ? { address } : {}),
+      },
+    };
+    const sent = await sock.sendMessage(jid, content);
+    if (sent?.key?.id) this.safeIngest(sent);
+    this.scheduleFlush();
+    return { to: jid, latitude, longitude, name: name ?? null, address: address ?? null };
+  }
+
+  async sendContact(
+    to: string,
+    contacts: { name: string; phone: string; email?: string }[],
+  ): Promise<{ to: string; sent: number }> {
+    const jid = normalizeJid(to);
+    if (contacts.length === 0) throw new WaError('INVALID_ARGUMENT', 'contacts must contain at least one entry.');
+    const sock = await this.requireReady();
+    const content: AnyMessageContent = {
+      contacts: {
+        displayName: contacts[0]?.name ?? 'Contact',
+        contacts: contacts.map((c) => ({ vcard: buildVcard(c.name, c.phone, c.email) })),
+      },
+    };
+    const sent = await sock.sendMessage(jid, content);
+    if (sent?.key?.id) this.safeIngest(sent);
+    this.scheduleFlush();
+    return { to: jid, sent: contacts.length };
+  }
+
+  async sendSticker(to: string, mediaPath: string): Promise<{ to: string; sticker: string }> {
+    const jid = normalizeJid(to);
+    await assertMediaReadable(mediaPath);
+    const content = buildStickerContent(mediaPath);
+    const sock = await this.requireReady();
+    const sent = await sock.sendMessage(jid, content);
+    if (sent?.key?.id) this.safeIngest(sent);
+    this.scheduleFlush();
+    return { to: jid, sticker: path.basename(mediaPath) };
+  }
+
+  async getGroupInfo(chat: string): Promise<{
+    id: string;
+    subject: string | null;
+    owner: string | null;
+    description: string | null;
+    created_at: number | null;
+    participant_count: number;
+    participants: { id: string; admin: string | null }[];
+  }> {
+    const jid = normalizeJid(chat);
+    if (!jid.endsWith('@g.us')) throw new WaError('INVALID_ARGUMENT', `${jid} is not a group (@g.us).`);
+    const sock = await this.requireReady();
+    if (!sock.groupMetadata) throw new WaError('NOT_CONNECTED', 'Group metadata is unavailable on this connection.');
+    const meta = await sock.groupMetadata(jid);
+    return {
+      id: jid,
+      subject: meta.subject ?? null,
+      owner: meta.owner ?? null,
+      description: meta.desc ?? null,
+      created_at: meta.creation ?? null,
+      participant_count: meta.participants?.length ?? 0,
+      participants: (meta.participants ?? []).map((p) => ({ id: p.id ?? '', admin: p.admin ?? null })),
+    };
+  }
+
+  async downloadMedia(
+    chat: string,
+    messageId: string,
+    saveDir?: string,
+  ): Promise<{ chat: string; message_id: string; path: string; bytes: number; mimetype: string }> {
+    const jid = normalizeJid(chat);
+    await this.requireReady();
+    const raw = this.store.getRaw(messageId);
+    if (!raw) {
+      throw new WaError(
+        'MEDIA_NOT_FOUND',
+        `Message ${messageId} is not in the raw cache; only recent messages can be downloaded. Ask for a resend or run sync.`,
+      );
+    }
+    const { buffer, mimetype } = await this.downloadRaw(raw);
+    const dir = saveDir ? path.resolve(saveDir) : path.join(this.opts.authDir, 'media');
+    mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${messageId}.${extForMime(mimetype)}`);
+    writeFileSync(file, buffer);
+    return { chat: jid, message_id: messageId, path: file, bytes: buffer.length, mimetype };
+  }
+
+  private async downloadRaw(raw: unknown): Promise<{ buffer: Buffer; mimetype: string }> {
+    if (this.opts.downloader) return this.opts.downloader(raw);
+    const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
+    const buffer = (await downloadMediaMessage(raw as never, 'buffer', {})) as Buffer;
+    return { buffer, mimetype: mediaMimetypeOf(raw) ?? 'application/octet-stream' };
   }
 
   async logout(): Promise<void> {

@@ -13,6 +13,7 @@ export interface StoredMessage {
   type: string;
   text: string;
   pushName?: string;
+  has_media?: boolean;
 }
 
 export interface ChatSummary {
@@ -20,6 +21,21 @@ export interface ChatSummary {
   name: string;
   last_ts: number | null;
   unread?: number;
+}
+
+export interface ChatInfo extends ChatSummary {
+  is_group: boolean;
+  message_count: number;
+}
+
+export interface ContactHit {
+  id: string;
+  name: string;
+  number: string | null;
+}
+
+export interface MessageHit extends StoredMessage {
+  chat_name: string;
 }
 
 interface ChatEntry {
@@ -33,7 +49,11 @@ interface Persisted {
   chats: ChatEntry[];
   messages: Record<string, StoredMessage[]>;
   names: Record<string, string>;
+  raw?: Record<string, unknown>;
 }
+
+/** How many raw messages to keep for quoting and media download. */
+const MAX_RAW = 200;
 
 const MAX_MESSAGES_PER_CHAT = 300;
 const MAX_CHATS = 1000;
@@ -72,6 +92,8 @@ export class ChatStore {
   private chats = new Map<string, ChatEntry>();
   private messages = new Map<string, StoredMessage[]>();
   private names = new Map<string, string>();
+  /** Raw WAMessages, newest last (capped) — needed to quote and to download media. */
+  private rawCache = new Map<string, unknown>();
   private dirty = false;
 
   constructor(private readonly file?: string) {
@@ -85,6 +107,7 @@ export class ChatStore {
       for (const c of data.chats ?? []) this.chats.set(c.id, c);
       for (const [k, v] of Object.entries(data.messages ?? {})) this.messages.set(k, v);
       for (const [k, v] of Object.entries(data.names ?? {})) this.names.set(k, v);
+      for (const [k, v] of Object.entries(data.raw ?? {})) this.rawCache.set(k, v);
     } catch {
       /* no store yet, or corrupt: start empty */
     }
@@ -97,6 +120,7 @@ export class ChatStore {
       chats: [...this.chats.values()],
       messages: Object.fromEntries(this.messages),
       names: Object.fromEntries(this.names),
+      raw: Object.fromEntries(this.rawCache),
     };
     mkdirSync(path.dirname(this.file), { recursive: true });
     const tmp = `${this.file}.tmp`;
@@ -150,6 +174,21 @@ export class ChatStore {
     this.dirty = true;
   }
 
+  /** Remember the raw message (newest last, capped) so quotes and media downloads work. */
+  putRaw(id: string, msg: unknown): void {
+    this.rawCache.delete(id);
+    this.rawCache.set(id, msg);
+    while (this.rawCache.size > MAX_RAW) {
+      const oldest = this.rawCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.rawCache.delete(oldest);
+    }
+  }
+
+  getRaw(id: string): unknown {
+    return this.rawCache.get(id);
+  }
+
   /** Returns true if the message was stored. Never throws on odd payloads. */
   ingestMessage(msg: WAMessage): boolean {
     const key = msg.key;
@@ -168,6 +207,7 @@ export class ChatStore {
       ts,
       type: desc.type,
       text: desc.text,
+      has_media: desc.type !== 'text',
     };
     if (msg.pushName) {
       stored.pushName = msg.pushName;
@@ -179,6 +219,7 @@ export class ChatStore {
     list.sort((a, b) => a.ts - b.ts);
     if (list.length > MAX_MESSAGES_PER_CHAT) list.splice(0, list.length - MAX_MESSAGES_PER_CHAT);
     this.messages.set(chatId, list);
+    this.putRaw(stored.id, msg);
     const entry = this.touchChat(chatId);
     if (ts > (entry.lastTs ?? 0)) entry.lastTs = ts;
     this.dirty = true;
@@ -208,5 +249,76 @@ export class ChatStore {
 
   hasChat(chatId: string): boolean {
     return this.chats.has(chatId) || this.messages.has(chatId);
+  }
+
+  /** Search contacts and chat names by substring (name or number). */
+  searchContacts(query: string, limit: number): ContactHit[] {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    const ids = new Set<string>([...this.names.keys(), ...this.chats.keys()]);
+    const hits: (ContactHit & { rank: number })[] = [];
+    for (const id of ids) {
+      const name = this.nameOf(id);
+      const number = jidToNumber(id) ?? null;
+      const nameHit = name.toLowerCase().includes(q);
+      const digits = id.replace(/\D/g, '');
+      const numberHit = digits.includes(q.replace(/\D/g, '')) && q.replace(/\D/g, '') !== '';
+      if (!nameHit && !numberHit) continue;
+      hits.push({ id, name, number, rank: name.toLowerCase().startsWith(q) ? 0 : 1 });
+    }
+    hits.sort((a, b) => a.rank - b.rank || a.name.localeCompare(b.name));
+    return hits.slice(0, limit).map(({ id, name, number }) => ({ id, name, number }));
+  }
+
+  /** Full-text search across cached messages, newest first. */
+  searchMessages(query: string, limit: number): MessageHit[] {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    const hits: MessageHit[] = [];
+    for (const [chatId, list] of this.messages) {
+      for (const m of list) {
+        if (m.text.toLowerCase().includes(q)) hits.push({ ...m, chat_name: this.nameOf(chatId) });
+      }
+    }
+    hits.sort((a, b) => b.ts - a.ts);
+    return hits.slice(0, limit);
+  }
+
+  getChatInfo(chatId: string): ChatInfo | undefined {
+    if (!this.hasChat(chatId)) return undefined;
+    const entry = this.chats.get(chatId);
+    const out: ChatInfo = {
+      id: chatId,
+      name: this.nameOf(chatId),
+      last_ts: entry?.lastTs ?? null,
+      is_group: chatId.endsWith('@g.us'),
+      message_count: (this.messages.get(chatId) ?? []).length,
+    };
+    if (entry?.unread !== undefined) out.unread = entry.unread;
+    return out;
+  }
+
+  lastInteraction(chatId: string): StoredMessage | undefined {
+    const list = this.messages.get(chatId) ?? [];
+    return list[list.length - 1];
+  }
+
+  getMessage(chatId: string, messageId: string): StoredMessage | undefined {
+    return (this.messages.get(chatId) ?? []).find((m) => m.id === messageId);
+  }
+
+  /** Window of messages around `messageId` (inclusive), plus its index in the window. */
+  messageContext(
+    chatId: string,
+    messageId: string,
+    before: number,
+    after: number,
+  ): { messages: StoredMessage[]; index: number } | undefined {
+    const list = this.messages.get(chatId) ?? [];
+    const at = list.findIndex((m) => m.id === messageId);
+    if (at < 0) return undefined;
+    const start = Math.max(0, at - before);
+    const end = Math.min(list.length, at + after + 1);
+    return { messages: list.slice(start, end), index: at - start };
   }
 }

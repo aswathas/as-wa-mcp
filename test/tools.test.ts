@@ -29,6 +29,14 @@ describe('tools (not paired)', () => {
       ['get_profile', {}],
       ['list_chats', {}],
       ['get_messages', { chat: '+911234567890' }],
+      ['search_contacts', { query: 'as' }],
+      ['search_messages', { query: 'hi' }],
+      ['get_chat', { chat: '+911234567890' }],
+      ['get_last_interaction', { chat: '+911234567890' }],
+      ['react_message', { chat: '+911234567890', message_id: 'M1', emoji: '👍' }],
+      ['mark_read', { chat: '+911234567890' }],
+      ['get_group_info', { chat: '120363012345678901@g.us' }],
+      ['download_media', { chat: '+911234567890', message_id: 'M1' }],
     ] as const) {
       const env = await tools[name]?.run(args);
       expect(env, name).toMatchObject({ ok: false, data: null, error: { code: 'NOT_PAIRED', hint: 'not paired, run: node dist/cli.js pair' } });
@@ -57,7 +65,26 @@ describe('MCP server over an in-memory transport', () => {
     await Promise.all([server.connect(a), client.connect(b)]);
 
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(['get_messages', 'get_profile', 'get_status', 'list_chats', 'send_message']);
+    expect(tools.map((t) => t.name)).toHaveLength(17);
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      'download_media',
+      'get_chat',
+      'get_group_info',
+      'get_last_interaction',
+      'get_message_context',
+      'get_messages',
+      'get_profile',
+      'get_status',
+      'list_chats',
+      'mark_read',
+      'react_message',
+      'search_contacts',
+      'search_messages',
+      'send_contact',
+      'send_location',
+      'send_message',
+      'send_sticker',
+    ]);
 
     const res = await client.callTool({ name: 'get_status', arguments: {} });
     const content = res.content as { type: string; text: string }[];
