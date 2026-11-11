@@ -5,6 +5,7 @@ import { baileysFactory } from './baileys.js';
 import { WaClient } from './client.js';
 import { createServer } from './server.js';
 import { openStore } from './sqlstore.js';
+import { WebhookSink } from './webhook.js';
 
 // stdout belongs to the MCP protocol; everything diagnostic goes to stderr.
 const log = (msg: string): void => {
@@ -23,6 +24,7 @@ async function main(): Promise<void> {
     store: openStore(authDir),
     log,
     publishRuntime: true,
+    webhook: new WebhookSink({ log }),
   });
 
   const server = createServer(client);

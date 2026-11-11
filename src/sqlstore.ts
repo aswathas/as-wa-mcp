@@ -4,8 +4,17 @@ import { DatabaseSync } from 'node:sqlite';
 import type { Chat, Contact, WAMessage } from '@whiskeysockets/baileys';
 import { STORE_FILE } from './auth.js';
 import { jidToNumber } from './jid.js';
-import { ChatStore, describeMessage } from './store.js';
-import type { ChatInfo, ChatSummary, ContactHit, MessageHit, Store, StoredMessage } from './store.js';
+import { ChatStore, describeMessage, mergeReceipt } from './store.js';
+import type {
+  ChatInfo,
+  ChatSummary,
+  ContactHit,
+  DeliveryStatus,
+  MessageHit,
+  ReceiptRecord,
+  Store,
+  StoredMessage,
+} from './store.js';
 
 /** Contact CHAT row from SQLite. */
 interface ChatRow {
@@ -24,6 +33,14 @@ interface MsgRow {
   text: string;
   push_name: string | null;
   has_media: number;
+}
+
+interface ReceiptRow {
+  message_id: string;
+  chat: string;
+  status: string;
+  ts: number;
+  participant: string | null;
 }
 
 function toStored(r: MsgRow): StoredMessage {
@@ -74,6 +91,11 @@ export class SqliteStore implements Store {
       CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat, ts);
       CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
       CREATE TABLE IF NOT EXISTS raw (id TEXT PRIMARY KEY, json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS receipts (
+        message_id TEXT NOT NULL, chat TEXT NOT NULL, status TEXT NOT NULL, ts INTEGER NOT NULL, participant TEXT,
+        PRIMARY KEY (message_id, chat)
+      );
+      CREATE INDEX IF NOT EXISTS idx_receipts_ts ON receipts(ts);
     `);
   }
 
@@ -98,7 +120,7 @@ export class SqliteStore implements Store {
     const stmt = this.db.prepare('INSERT INTO contacts (id, name) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name');
     for (const c of contacts) {
       const name = c.name ?? c.notify ?? c.verifiedName;
-      if (c.id && name) stmt.run(c.id, name);
+      if (c.id) stmt.run(c.id, name ?? null);
     }
   }
 
@@ -265,6 +287,40 @@ export class SqliteStore implements Store {
     const start = Math.max(0, at - before);
     const end = Math.min(rows.length, at + after + 1);
     return { messages: rows.slice(start, end).map(toStored), index: at - start };
+  }
+
+  recordReceipt(rec: ReceiptRecord): void {
+    const row = this.db
+      .prepare('SELECT status, ts, participant FROM receipts WHERE message_id = ? AND chat = ?')
+      .get(rec.message_id, rec.chat) as { status?: string; ts?: number; participant?: string | null } | undefined;
+    const existing: ReceiptRecord | undefined = row?.status
+      ? {
+          message_id: rec.message_id,
+          chat: rec.chat,
+          status: row.status as DeliveryStatus,
+          ts: Number(row.ts ?? 0),
+          ...(row.participant ? { participant: row.participant } : {}),
+        }
+      : undefined;
+    const merged = mergeReceipt(existing, rec);
+    this.db
+      .prepare('INSERT OR REPLACE INTO receipts (message_id, chat, status, ts, participant) VALUES (?, ?, ?, ?, ?)')
+      .run(merged.message_id, merged.chat, merged.status, merged.ts, merged.participant ?? null);
+  }
+
+  listReceipts(limit: number, chatId?: string): ReceiptRecord[] {
+    const rows = (
+      chatId
+        ? this.db.prepare('SELECT * FROM receipts WHERE chat = ? ORDER BY ts DESC LIMIT ?').all(chatId, limit)
+        : this.db.prepare('SELECT * FROM receipts ORDER BY ts DESC LIMIT ?').all(limit)
+    ) as unknown as ReceiptRow[];
+    return rows.map((r) => ({
+      message_id: r.message_id,
+      chat: r.chat,
+      status: r.status as DeliveryStatus,
+      ts: Number(r.ts),
+      ...(r.participant ? { participant: r.participant } : {}),
+    }));
   }
 }
 

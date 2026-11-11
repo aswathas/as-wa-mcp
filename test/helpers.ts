@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { WAMessage } from '@whiskeysockets/baileys';
+import type { Contact, WAMessage } from '@whiskeysockets/baileys';
 import { WaClient } from '../src/client.js';
 import type { ClientOptions, SocketEvents, SocketFactory, Timers, WaSocketLike } from '../src/client.js';
 
@@ -82,6 +82,14 @@ export class FakeSocket implements WaSocketLike {
   async logout(): Promise<void> {}
   end(): void {
     this.ended = true;
+  }
+
+  /** Baileys resyncs app state on request; the server answers with events. */
+  resyncCalls: { names: readonly string[]; initial: boolean }[] = [];
+  resyncContacts: Partial<Contact>[] = [{ id: '919999999999@s.whatsapp.net', name: 'Resync Contact' }];
+  async resyncAppState(names: readonly string[], initial: boolean): Promise<void> {
+    this.resyncCalls.push({ names: [...names], initial });
+    this.emit('contacts.upsert', this.resyncContacts as never);
   }
 }
 

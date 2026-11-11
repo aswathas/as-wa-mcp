@@ -14,6 +14,8 @@ export interface StoredMessage {
   text: string;
   pushName?: string;
   has_media?: boolean;
+  /** Delivery status of this message, when we sent it and a receipt is known. */
+  status?: DeliveryStatus;
 }
 
 export interface ChatSummary {
@@ -38,6 +40,35 @@ export interface MessageHit extends StoredMessage {
   chat_name: string;
 }
 
+/** Delivery lifecycle of a message we sent. */
+export type DeliveryStatus = 'sent' | 'delivered' | 'read' | 'played' | 'error';
+
+export interface ReceiptRecord {
+  message_id: string;
+  chat: string;
+  status: DeliveryStatus;
+  /** Unix seconds. */
+  ts: number;
+  /** Who read it (group participants). */
+  participant?: string;
+}
+
+/** Progress order — a receipt only ever moves forward. */
+const STATUS_RANK: Record<DeliveryStatus, number> = { error: 0, sent: 1, delivered: 2, read: 3, played: 4 };
+
+export function receiptKey(chat: string, messageId: string): string {
+  return `${chat}|${messageId}`;
+}
+
+/** Merge two receipts for one message: keep the furthest status reached. */
+export function mergeReceipt(existing: ReceiptRecord | undefined, incoming: ReceiptRecord): ReceiptRecord {
+  if (!existing) return incoming;
+  if (incoming.status === 'error') return { ...incoming, ts: Math.max(incoming.ts, existing.ts) };
+  const keep = STATUS_RANK[incoming.status] >= STATUS_RANK[existing.status] ? incoming : existing;
+  const participant = keep.participant ?? incoming.participant;
+  return { ...keep, ts: Math.max(keep.ts, incoming.ts), ...(participant ? { participant } : {}) };
+}
+
 interface ChatEntry {
   id: string;
   name?: string;
@@ -50,6 +81,7 @@ interface Persisted {
   messages: Record<string, StoredMessage[]>;
   names: Record<string, string>;
   raw?: Record<string, unknown>;
+  receipts?: ReceiptRecord[];
 }
 
 /** How many raw messages to keep for quoting and media download. */
@@ -79,6 +111,10 @@ export interface Store {
     before: number,
     after: number,
   ): { messages: StoredMessage[]; index: number } | undefined;
+  /** Record (or upgrade) the delivery status of one message. */
+  recordReceipt(rec: ReceiptRecord): void;
+  /** Receipts, newest first; optionally restricted to one chat. */
+  listReceipts(limit: number, chatId?: string): ReceiptRecord[];
 }
 
 const MAX_MESSAGES_PER_CHAT = Number(process.env['WA_MCP_MAX_PER_CHAT'] ?? 5000);
@@ -120,6 +156,8 @@ export class ChatStore implements Store {
   private names = new Map<string, string>();
   /** Raw WAMessages, newest last (capped) — needed to quote and to download media. */
   private rawCache = new Map<string, unknown>();
+  /** Delivery/read receipts, keyed by chat|messageId. */
+  private receipts = new Map<string, ReceiptRecord>();
   private dirty = false;
 
   constructor(private readonly file?: string) {
@@ -134,6 +172,7 @@ export class ChatStore implements Store {
       for (const [k, v] of Object.entries(data.messages ?? {})) this.messages.set(k, v);
       for (const [k, v] of Object.entries(data.names ?? {})) this.names.set(k, v);
       for (const [k, v] of Object.entries(data.raw ?? {})) this.rawCache.set(k, v);
+      for (const r of data.receipts ?? []) this.receipts.set(receiptKey(r.chat, r.message_id), r);
     } catch {
       /* no store yet, or corrupt: start empty */
     }
@@ -147,6 +186,7 @@ export class ChatStore implements Store {
       messages: Object.fromEntries(this.messages),
       names: Object.fromEntries(this.names),
       raw: Object.fromEntries(this.rawCache),
+      receipts: [...this.receipts.values()],
     };
     mkdirSync(path.dirname(this.file), { recursive: true });
     const tmp = `${this.file}.tmp`;
@@ -366,5 +406,17 @@ export class ChatStore implements Store {
     const start = Math.max(0, at - before);
     const end = Math.min(list.length, at + after + 1);
     return { messages: list.slice(start, end), index: at - start };
+  }
+
+  recordReceipt(rec: ReceiptRecord): void {
+    const key = receiptKey(rec.chat, rec.message_id);
+    this.receipts.set(key, mergeReceipt(this.receipts.get(key), rec));
+    this.dirty = true;
+  }
+
+  listReceipts(limit: number, chatId?: string): ReceiptRecord[] {
+    const out = [...this.receipts.values()].filter((r) => !chatId || r.chat === chatId);
+    out.sort((a, b) => b.ts - a.ts);
+    return out.slice(0, limit);
   }
 }

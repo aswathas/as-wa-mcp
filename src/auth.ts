@@ -25,10 +25,18 @@ function readCreds(authDir: string): CredsFile | undefined {
   }
 }
 
-/** True if a completed pairing is stored on disk. */
+/**
+ * True if a completed pairing is stored on disk.
+ *
+ * The stored identity (`me.id`) is the source of truth, not the `registered`
+ * flag: Baileys only sets `registered = true` in the phone-number (companion)
+ * pairing flow, so a device linked by QR stays `registered: false` forever even
+ * though the session is valid. Baileys itself keys the protocol off `me`
+ * (`socket.js`: `if (!creds.me) register else login`).
+ */
 export function isRegistered(authDir: string): boolean {
   const creds = readCreds(authDir);
-  return Boolean(creds?.registered && creds.me?.id);
+  return Boolean(creds?.me?.id);
 }
 
 export function readMe(authDir: string): { id: string; name?: string; lid?: string } | undefined {

@@ -7,8 +7,12 @@ import { WaClient } from './client.js';
 import { WaError, fail, notPairedError, ok } from './errors.js';
 import type { Envelope } from './errors.js';
 import { jidToNumber, normalizeJid } from './jid.js';
+import { createWaApi, runCode } from './codemode.js';
+import { createFileApi } from './files.js';
+import { WaitCoordinator } from './waits.js';
 import { openStore } from './sqlstore.js';
 import type { Store } from './store.js';
+import { WebhookSink } from './webhook.js';
 
 const USAGE = `wa-mcp CLI
   pair [--phone <number>]              link WhatsApp (QR in terminal, or pairing code with --phone)
@@ -17,6 +21,8 @@ const USAGE = `wa-mcp CLI
   sync [seconds]                       connect briefly to refresh the local chat/message cache
   chats [limit]                        recent chats (from local cache)
   messages <chat> [n]                  recent messages in a chat (from local cache)
+  statuses [chat] [limit]               delivery/read receipts for messages you sent (local store)
+  webhook                               inbound webhook configuration and delivery counters
   contacts <query> [limit]             search contacts by name or number
   search <query> [limit]               full-text search across cached messages
   chat <id>                            metadata for one chat
@@ -30,16 +36,17 @@ const USAGE = `wa-mcp CLI
   vcard <to> <name> <phone> [email]    send a contact card
   group <chat>                         group metadata (subject, participants)
   edit <chat> <message_id> <text>      edit one of your own messages
-  del <chat> <message_id>              revoke (delete for everyone) your message
+  del <chat> <message_id> [--confirm]  revoke (delete for everyone) your message
   typing <chat> [state]                composing|paused|recording|available|unavailable
   all-contacts [limit]                 list every known contact
   new [since_ts] [limit] [chat]        messages since a timestamp (0 = cached window)
   wait [chat] [seconds]                block until a new message arrives (max 60 s)
-  leave <chat>                         leave a group
-  participants <act> <chat> <phone...> act = add|remove|promote|demote
+  leave <chat> [--confirm]             leave a group
+  participants <act> <chat> <phone...> [--confirm] act = add|remove|promote|demote
   invite <chat> [--reset]              group invite code + link (--reset revokes)
   group-set <chat> [--subject <s>] [--description <d>]   rename/redescribe a group
   create-group <subject> <phone...>    create a new group
+  code "<js>" [--timeout ms]            run a code-mode snippet (wa.* helpers, wa.files, resumable waits)
 `;
 
 const log = (msg: string): void => {
@@ -181,6 +188,20 @@ function cmdMessages(authDir: string, args: string[]): Envelope<unknown> {
   return ok(localStore(authDir).getMessages(requireArg(args[0], 'chat'), positiveInt(args[1], 20, 'n')));
 }
 
+function cmdStatuses(authDir: string, args: string[]): Envelope<unknown> {
+  const chat = args[0] ? normalizeJid(args[0]) : undefined;
+  const limit = positiveInt(args[1] ?? '50', 50, 'limit');
+  return ok(localStore(authDir).listReceipts(limit, chat));
+}
+
+function cmdWebhook(): Envelope<unknown> {
+  const status = new WebhookSink().status();
+  return ok({
+    ...status,
+    ...(status.enabled ? {} : { hint: 'set WA_MCP_WEBHOOK_URL to enable inbound push' }),
+  });
+}
+
 function localStore(authDir: string): Store {
   if (!isRegistered(authDir)) throw notPairedError();
   return openStore(authDir);
@@ -288,9 +309,11 @@ function cmdEdit(authDir: string, args: string[]): Promise<Envelope<unknown>> {
 }
 
 function cmdDelete(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  // The flag is read first so it can sit anywhere in the argument list.
+  const confirmed = boolFlag(args, '--confirm');
   const chat = requireArg(args[0], 'chat');
   const messageId = requireArg(args[1], 'message_id');
-  return withClient(authDir, false, (c) => c.remove(chat, messageId));
+  return withClient(authDir, false, (c) => c.remove(chat, messageId, confirmed));
 }
 
 function cmdTyping(authDir: string, args: string[]): Promise<Envelope<unknown>> {
@@ -325,11 +348,13 @@ function cmdWait(authDir: string, args: string[]): Promise<Envelope<unknown>> {
 }
 
 function cmdLeave(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const confirmed = boolFlag(args, '--confirm');
   const chat = requireArg(args[0], 'chat');
-  return withClient(authDir, false, (c) => c.leaveGroup(chat));
+  return withClient(authDir, false, (c) => c.leaveGroup(chat, confirmed));
 }
 
 function cmdParticipants(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const confirmed = boolFlag(args, '--confirm');
   const action = requireArg(args[0], 'action');
   if (!['add', 'remove', 'promote', 'demote'].includes(action)) {
     throw new WaError('INVALID_ARGUMENT', 'action must be add|remove|promote|demote');
@@ -338,7 +363,7 @@ function cmdParticipants(authDir: string, args: string[]): Promise<Envelope<unkn
   const phones = args.slice(2);
   if (phones.length === 0) throw new WaError('INVALID_ARGUMENT', 'usage: participants <action> <chat> <phone...>');
   return withClient(authDir, false, (c) =>
-    c.groupParticipants(chat, action as 'add' | 'remove' | 'promote' | 'demote', phones),
+    c.groupParticipants(chat, action as 'add' | 'remove' | 'promote' | 'demote', phones, confirmed),
   );
 }
 
@@ -364,6 +389,27 @@ function cmdCreateGroup(authDir: string, args: string[]): Promise<Envelope<unkno
   return withClient(authDir, false, (c) => c.createGroup(subject, phones));
 }
 
+async function cmdCode(authDir: string, args: string[]): Promise<Envelope<unknown>> {
+  const force = boolFlag(args, '--force');
+  const timeoutRaw = flag(args, '--timeout');
+  const code = args.join(' ').trim();
+  if (!code) throw new WaError('INVALID_ARGUMENT', 'usage: code "<js>" [--timeout ms]');
+  if (isRegistered(authDir)) refuseIfServerLive(authDir, force);
+  const client = makeClient(authDir);
+  try {
+    const files = createFileApi(authDir);
+    const waits = new WaitCoordinator(client);
+    return await runCode(
+      code,
+      createWaApi(client),
+      timeoutRaw ? positiveInt(timeoutRaw, 5000, '--timeout') : 5000,
+      { files, waits },
+    );
+  } finally {
+    await client.stop();
+  }
+}
+
 async function main(): Promise<number> {
   const [cmd, ...args] = process.argv.slice(2);
   const authDir = defaultAuthDir();
@@ -387,6 +433,12 @@ async function main(): Promise<number> {
         break;
       case 'messages':
         env = cmdMessages(authDir, args);
+        break;
+      case 'statuses':
+        env = cmdStatuses(authDir, args);
+        break;
+      case 'webhook':
+        env = cmdWebhook();
         break;
       case 'contacts':
         env = cmdContacts(authDir, args);
@@ -453,6 +505,9 @@ async function main(): Promise<number> {
         break;
       case 'group-set':
         env = await cmdGroupSet(authDir, args);
+        break;
+      case 'code':
+        env = await cmdCode(authDir, args);
         break;
       case 'create-group':
         env = await cmdCreateGroup(authDir, args);

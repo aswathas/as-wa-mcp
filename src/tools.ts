@@ -269,12 +269,12 @@ export function createTools(client: WaClient): ToolDef[] {
     },
     {
       name: 'delete_message',
-      description: 'Revoke (delete for everyone) one of your own messages.',
-      shape: { chat: chatArg, message_id: z.string().min(1) },
+      description: 'Revoke (delete for everyone) one of your own messages. Requires confirm:true.',
+      shape: { chat: chatArg, message_id: z.string().min(1), confirm: z.boolean().optional().describe('Must be true to actually delete.') },
       run: (args) =>
         toEnvelope(async () => {
-          const a = parse({ chat: z.string(), message_id: z.string().min(1) }, args);
-          return client.remove(a.chat, a.message_id);
+          const a = parse({ chat: z.string(), message_id: z.string().min(1), confirm: z.boolean().optional() }, args);
+          return client.remove(a.chat, a.message_id, a.confirm === true);
         }),
     },
     {
@@ -295,12 +295,15 @@ export function createTools(client: WaClient): ToolDef[] {
     },
     {
       name: 'list_contacts',
-      description: 'List known contacts and chat names (alphabetical).',
-      shape: { limit: limitSchema(50, 5000).describe('Max contacts to return (1-5000).') },
+      description: 'List every known contact and chat name (alphabetical), optionally filtered by a name or number.',
+      shape: {
+        query: z.string().optional().describe('Optional case-insensitive filter on name, number or jid.'),
+        limit: limitSchema(5000, 100000).describe('Max contacts to return (1-100000).'),
+      },
       run: (args) =>
         toEnvelope(async () => {
-          const a = parse({ limit: limitSchema(50, 5000) }, args);
-          return client.listContacts(a.limit);
+          const a = parse({ query: z.string().optional(), limit: limitSchema(5000, 100000) }, args);
+          return client.listContacts(a.limit, a.query);
         }),
     },
     {
@@ -339,12 +342,12 @@ export function createTools(client: WaClient): ToolDef[] {
     },
     {
       name: 'leave_group',
-      description: 'Leave a group (your account is removed from it).',
-      shape: { chat: chatArg },
+      description: 'Leave a group (your account is removed from it). Requires confirm:true.',
+      shape: { chat: chatArg, confirm: z.boolean().optional().describe('Must be true to actually leave.') },
       run: (args) =>
         toEnvelope(async () => {
-          const a = parse({ chat: z.string() }, args);
-          return client.leaveGroup(a.chat);
+          const a = parse({ chat: z.string(), confirm: z.boolean().optional() }, args);
+          return client.leaveGroup(a.chat, a.confirm === true);
         }),
     },
     {
@@ -354,6 +357,7 @@ export function createTools(client: WaClient): ToolDef[] {
         chat: chatArg,
         action: z.enum(['add', 'remove', 'promote', 'demote']).describe('What to do with the listed participants.'),
         phones: z.array(z.string()).min(1).describe('Participant phone numbers (or user JIDs).'),
+        confirm: z.boolean().optional().describe('Must be true for remove/promote/demote.'),
       },
       run: (args) =>
         toEnvelope(async () => {
@@ -362,10 +366,11 @@ export function createTools(client: WaClient): ToolDef[] {
               chat: z.string(),
               action: z.enum(['add', 'remove', 'promote', 'demote']),
               phones: z.array(z.string()).min(1),
+              confirm: z.boolean().optional(),
             },
             args,
           );
-          return client.groupParticipants(a.chat, a.action, a.phones);
+          return client.groupParticipants(a.chat, a.action, a.phones, a.confirm === true);
         }),
     },
     {
@@ -413,6 +418,35 @@ export function createTools(client: WaClient): ToolDef[] {
         await client.ensureStarted();
         return client.status();
       }),
+    },
+    {
+      name: 'get_message_status',
+      description:
+        'Delivery/read status of messages you sent: sent, delivered, read, played or error. Returns the status of one message, or of every tracked message when message_id is omitted.',
+      shape: {
+        chat: z.string().optional().describe('Restrict to one chat (number or JID).'),
+        message_id: z.string().optional().describe('Restrict to one message id.'),
+      },
+      run: (args) =>
+        toEnvelope(async () => {
+          const a = parse({ chat: z.string().optional(), message_id: z.string().optional() }, args);
+          const all = await client.listReceipts(200, a.chat);
+          const receipts = a.message_id ? all.filter((r) => r.message_id === a.message_id) : all;
+          return { receipts, count: receipts.length };
+        }),
+    },
+    {
+      name: 'sync_contacts',
+      description: 'Ask WhatsApp to resend the contact list, persist every contact, and report {synced, total}.',
+      shape: {},
+      run: () => toEnvelope(async () => client.syncContacts()),
+    },
+    {
+      name: 'get_webhook_status',
+      description:
+        'Status of the inbound webhook sink (WA_MCP_WEBHOOK_URL): enabled, url, delivered/failed counts, last error.',
+      shape: {},
+      run: () => toEnvelope(async () => client.webhookStatus()),
     },
   ];
 }

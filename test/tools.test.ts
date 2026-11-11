@@ -38,13 +38,13 @@ describe('tools (not paired)', () => {
       ['get_group_info', { chat: '120363012345678901@g.us' }],
       ['download_media', { chat: '+911234567890', message_id: 'M1' }],
       ['edit_message', { chat: '+911234567890', message_id: 'M1', text: 'x' }],
-      ['delete_message', { chat: '+911234567890', message_id: 'M1' }],
+      ['delete_message', { chat: '+911234567890', message_id: 'M1', confirm: true }],
       ['send_typing', { chat: '+911234567890' }],
       ['list_contacts', {}],
       ['get_new_messages', { since_ts: 0 }],
       ['wait_for_messages', { timeout_s: 1 }],
-      ['leave_group', { chat: '120363012345678901@g.us' }],
-      ['group_participants', { chat: '120363012345678901@g.us', action: 'add', phones: ['+911234567890'] }],
+      ['leave_group', { chat: '120363012345678901@g.us', confirm: true }],
+      ['group_participants', { chat: '120363012345678901@g.us', action: 'add', phones: ['+911234567890'], confirm: true }],
       ['get_group_invite', { chat: '120363012345678901@g.us' }],
       ['update_group', { chat: '120363012345678901@g.us', subject: 'x' }],
       ['create_group', { subject: 'x', phones: ['+911234567890'] }],
@@ -67,7 +67,7 @@ describe('tools (not paired)', () => {
 });
 
 describe('MCP server over an in-memory transport', () => {
-  it('lists the five tools and returns envelopes as text content', async () => {
+  it('lists every tool and returns envelopes as text content', async () => {
     const h = makeHarness(false);
     await h.client.start();
     const server = createServer(h.client);
@@ -76,7 +76,7 @@ describe('MCP server over an in-memory transport', () => {
     await Promise.all([server.connect(a), client.connect(b)]);
 
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name)).toHaveLength(28);
+    expect(tools.map((t) => t.name)).toHaveLength(31);
     expect(tools.map((t) => t.name).sort()).toEqual([
       'create_group',
       'delete_message',
@@ -87,10 +87,12 @@ describe('MCP server over an in-memory transport', () => {
       'get_group_invite',
       'get_last_interaction',
       'get_message_context',
+      'get_message_status',
       'get_messages',
       'get_new_messages',
       'get_profile',
       'get_status',
+      'get_webhook_status',
       'group_participants',
       'leave_group',
       'list_chats',
@@ -104,6 +106,7 @@ describe('MCP server over an in-memory transport', () => {
       'send_message',
       'send_sticker',
       'send_typing',
+      'sync_contacts',
       'update_group',
       'wait_for_messages',
     ]);
@@ -111,6 +114,14 @@ describe('MCP server over an in-memory transport', () => {
     const res = await client.callTool({ name: 'get_status', arguments: {} });
     const content = res.content as { type: string; text: string }[];
     expect(JSON.parse(content[0]?.text ?? '')).toMatchObject({ ok: true, data: { status: 'not_paired' }, error: null });
+
+    const webhook = await client.callTool({ name: 'get_webhook_status', arguments: {} });
+    const webhookText = (webhook.content as { type: string; text: string }[])[0]?.text ?? '';
+    expect(JSON.parse(webhookText)).toMatchObject({ ok: true, data: { enabled: false }, error: null });
+
+    const receipts = await client.callTool({ name: 'get_message_status', arguments: {} });
+    const receiptsText = (receipts.content as { type: string; text: string }[])[0]?.text ?? '';
+    expect(JSON.parse(receiptsText)).toMatchObject({ ok: true, data: { count: 0 }, error: null });
 
     const sent = await client.callTool({ name: 'send_message', arguments: { to: '+911234567890', text: 'hi' } });
     expect(sent.isError).toBe(true);

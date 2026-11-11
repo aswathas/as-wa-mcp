@@ -260,11 +260,37 @@ describe('new tools against a connected client', () => {
       edit: { remoteJid: JID, id: 'M1', fromMe: true },
       text: 'fixed',
     });
-    expect(await tools['delete_message']?.run({ chat: '+911234567890', message_id: 'M1' })).toMatchObject({
+    expect(await tools['delete_message']?.run({ chat: '+911234567890', message_id: 'M1', confirm: true })).toMatchObject({
       ok: true,
       data: { revoked: true },
     });
     expect(sock.sent[1]?.content).toEqual({ delete: { remoteJid: JID, id: 'M1', fromMe: true } });
+  });
+
+  it('refuses destructive actions without an explicit confirm', async () => {
+    const { sock, tools } = await ready();
+    const del = await tools['delete_message']?.run({ chat: '+911234567890', message_id: 'M1' });
+    expect(del).toMatchObject({ ok: false, data: null, error: { code: 'CONFIRMATION_REQUIRED' } });
+    const leave = await tools['leave_group']?.run({ chat: '120363012345678901@g.us' });
+    expect(leave).toMatchObject({ ok: false, data: null, error: { code: 'CONFIRMATION_REQUIRED' } });
+    const demote = await tools['group_participants']?.run({
+      chat: '120363012345678901@g.us',
+      action: 'demote',
+      phones: ['+911234567890'],
+    });
+    expect(demote).toMatchObject({ ok: false, data: null, error: { code: 'CONFIRMATION_REQUIRED' } });
+    // Nothing was sent: the refusal happens before the socket is touched.
+    expect(sock.sent).toHaveLength(0);
+  });
+
+  it('refuses destructive actions even when the session is not paired', async () => {
+    const h = makeHarness(false);
+    await h.client.start();
+    const tools = Object.fromEntries(createTools(h.client).map((t) => [t.name, t]));
+    const del = await tools['delete_message']?.run({ chat: '+911234567890', message_id: 'M1' });
+    expect(del).toMatchObject({ ok: false, data: null, error: { code: 'CONFIRMATION_REQUIRED' } });
+    const leave = await tools['leave_group']?.run({ chat: '120363012345678901@g.us' });
+    expect(leave).toMatchObject({ ok: false, data: null, error: { code: 'CONFIRMATION_REQUIRED' } });
   });
 
   it('send_typing emits a presence update', async () => {
@@ -303,11 +329,11 @@ describe('new tools against a connected client', () => {
 
   it('group admin: leave, participants, invite, update, create', async () => {
     const { sock, tools } = await ready();
-    expect(await tools['leave_group']?.run({ chat: GROUP })).toMatchObject({ ok: true, data: { left: true } });
+    expect(await tools['leave_group']?.run({ chat: GROUP, confirm: true })).toMatchObject({ ok: true, data: { left: true } });
     expect(sock.groupCalls[0]).toEqual({ op: 'leave', target: GROUP });
 
     expect(
-      await tools['group_participants']?.run({ chat: GROUP, action: 'promote', phones: ['+918888888888'] }),
+      await tools['group_participants']?.run({ chat: GROUP, action: 'promote', phones: ['+918888888888'], confirm: true }),
     ).toMatchObject({ ok: true, data: { action: 'promote' } });
     expect(sock.groupCalls[1]).toMatchObject({ op: 'promote', target: GROUP, args: ['918888888888@s.whatsapp.net'] });
 
@@ -335,15 +361,15 @@ describe('new tools against a connected client', () => {
 
   it('group admin rejects non-groups and bad input', async () => {
     const { tools } = await ready();
-    expect(await tools['leave_group']?.run({ chat: '+911234567890' })).toMatchObject({
+    expect(await tools['leave_group']?.run({ chat: '+911234567890', confirm: true })).toMatchObject({
       ok: false,
       error: { code: 'INVALID_ARGUMENT' },
     });
-    expect(await tools['group_participants']?.run({ chat: GROUP, action: 'add', phones: [] })).toMatchObject({
+    expect(await tools['group_participants']?.run({ chat: GROUP, action: 'add', phones: [], confirm: true })).toMatchObject({
       ok: false,
       error: { code: 'INVALID_ARGUMENT' },
     });
-    expect(await tools['group_participants']?.run({ chat: GROUP, action: 'banish', phones: ['+911234567890'] })).toMatchObject({
+    expect(await tools['group_participants']?.run({ chat: GROUP, action: 'banish', phones: ['+911234567890'], confirm: true })).toMatchObject({
       ok: false,
       error: { code: 'INVALID_ARGUMENT' },
     });

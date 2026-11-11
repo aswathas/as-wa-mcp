@@ -3,15 +3,24 @@
   "version": "1.0.0",
   "description": "WhatsApp MCP server + CLI (multi-device, Baileys)",
   "main": "dist/mcp.js",
+  "files": [
+    "dist",
+    "scripts/pair-qr.mjs",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "smoke": "node scripts/smoke-mcp.mjs",
     "start": "node dist/mcp.js",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "postinstall": "node scripts/patch-sdk.mjs"
   },
   "keywords": [],
-  "author": "",
+  "author": "Aswath",
   "license": "MIT",
   "type": "module",
   "dependencies": {
@@ -24,6 +33,7 @@
   "devDependencies": {
     "@types/node": "^26.6.6",
     "@types/qrcode-terminal": "^0.12.2",
+    "qrcode": "^1.5.4",
     "typescript": "^7.0.2",
     "vitest": "^5.1.0"
   },

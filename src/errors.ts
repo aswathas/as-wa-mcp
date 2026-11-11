@@ -1,12 +1,22 @@
-export type ErrorCode =
-  | 'NOT_PAIRED'
-  | 'NOT_CONNECTED'
-  | 'INVALID_RECIPIENT'
-  | 'INVALID_ARGUMENT'
-  | 'MEDIA_NOT_FOUND'
-  | 'MEDIA_TOO_LARGE'
-  | 'SEND_FAILED'
-  | 'INTERNAL';
+export const ERROR_CODES = [
+  'NOT_PAIRED',
+  'NOT_CONNECTED',
+  'INVALID_RECIPIENT',
+  'INVALID_ARGUMENT',
+  'MEDIA_NOT_FOUND',
+  'MEDIA_TOO_LARGE',
+  'SEND_FAILED',
+  'CONFIRMATION_REQUIRED',
+  'CODE_ERROR',
+  'CODE_TIMEOUT',
+  'CODE_FORBIDDEN',
+  'FILE_FORBIDDEN',
+  'FILE_NOT_FOUND',
+  'FILE_TOO_LARGE',
+  'INTERNAL',
+] as const;
+
+export type ErrorCode = (typeof ERROR_CODES)[number];
 
 export const PAIR_HINT = 'not paired, run: node dist/cli.js pair';
 

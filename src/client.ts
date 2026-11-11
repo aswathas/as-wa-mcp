@@ -16,8 +16,19 @@ import {
 import type { SendInput } from './media.js';
 import { DEFAULT_BACKOFF, backoffDelay, initialState, reduce, toStatusReport } from './state.js';
 import type { BackoffOptions, ConnEvent, ConnState, StatusReport } from './state.js';
-import { ChatStore } from './store.js';
-import type { ChatInfo, ChatSummary, ContactHit, MessageHit, Store, StoredMessage } from './store.js';
+import { ChatStore, describeMessage } from './store.js';
+import type {
+  ChatInfo,
+  ChatSummary,
+  ContactHit,
+  DeliveryStatus,
+  MessageHit,
+  ReceiptRecord,
+  Store,
+  StoredMessage,
+} from './store.js';
+import { WebhookSink } from './webhook.js';
+import type { WebhookStatus } from './webhook.js';
 
 /** The subset of Baileys' socket events this client consumes. */
 export interface SocketEvents {
@@ -29,6 +40,53 @@ export interface SocketEvents {
   'chats.update': ChatUpdate[];
   'contacts.upsert': Contact[];
   'contacts.update': Partial<Contact>[];
+  /** Delivery/read status changes for messages we sent. */
+  'messages.update': unknown[];
+  /** Per-user read/played receipts. */
+  'message-receipt.update': unknown[];
+}
+
+/** Baileys message status enum (proto.WebMessageInfo.Status). */
+export const WA_STATUS: Record<number, DeliveryStatus> = {
+  0: 'error',
+  1: 'sent',
+  2: 'sent',
+  3: 'delivered',
+  4: 'read',
+  5: 'played',
+};
+
+/** The part of the 'messages.update' payload we care about. */
+export interface MessageUpdateEvent {
+  key?: { id?: string | null; remoteJid?: string | null; remoteJidAlt?: string | null } | null;
+  update?: { status?: number | null } | null;
+}
+
+/** The part of the 'message-receipt.update' payload we care about. */
+export interface ReceiptUpdateEvent {
+  key?: {
+    id?: string | null;
+    remoteJid?: string | null;
+    remoteJidAlt?: string | null;
+    participant?: string | null;
+  } | null;
+  receipt?: {
+    userJid?: string | null;
+    receiptTimestamp?: number | { toNumber(): number } | null;
+    readTimestamp?: number | { toNumber(): number } | null;
+    playedTimestamp?: number | { toNumber(): number } | null;
+  } | null;
+}
+
+/** Long/number timestamps arrive in several shapes; normalise to unix seconds. */
+export function toUnixSeconds(ts: unknown): number | null {
+  if (typeof ts === 'number') return Math.floor(ts);
+  if (typeof ts === 'string' && ts !== '') return Math.floor(Number(ts)) || null;
+  if (ts && typeof ts === 'object' && 'toNumber' in ts) {
+    const fn = (ts as { toNumber: unknown }).toNumber;
+    if (typeof fn === 'function') return Math.floor(fn.call(ts));
+  }
+  return null;
 }
 
 /** The subset of Baileys' WASocket this client uses (lets tests inject a fake). */
@@ -93,6 +151,8 @@ export interface ClientOptions {
   publishRuntime?: boolean;
   /** Override media download (tests). */
   downloader?: MediaDownloader;
+  /** External sink for inbound messages and receipts. */
+  webhook?: WebhookSink;
 }
 
 export interface StartOptions {
@@ -136,6 +196,8 @@ export function statusCodeOf(err: unknown): number | undefined {
 }
 
 export class WaClient {
+  /** Contacts seen this session (contacts.upsert / contacts.update). */
+  private contactsSeen = 0;
   private readonly bus = new EventEmitter();
   private readonly store: Store;
   private readonly now: () => number;
@@ -157,6 +219,7 @@ export class WaClient {
   private cancelReconnect: (() => void) | undefined;
   private cancelFlush: (() => void) | undefined;
   private credsChain: Promise<void> = Promise.resolve();
+  private readonly webhook: WebhookSink | undefined;
 
   constructor(private readonly opts: ClientOptions) {
     this.now = opts.now ?? Date.now;
@@ -166,6 +229,7 @@ export class WaClient {
     this.log = opts.log ?? (() => undefined);
     this.connectWaitMs = opts.connectWaitMs ?? 20_000;
     this.store = opts.store ?? new ChatStore();
+    this.webhook = opts.webhook;
     this.st = initialState(this.now());
     this.apply({ type: 'init', registered: isRegistered(opts.authDir) });
   }
@@ -353,7 +417,11 @@ export class WaClient {
       'messages.upsert',
       guard('messages.upsert', ({ messages }) => {
         let added = false;
-        for (const m of messages) added = this.safeIngest(m) || added;
+        for (const m of messages) {
+          const fresh = this.safeIngest(m);
+          added = fresh || added;
+          if (fresh && !m.key?.fromMe) this.pushInbound(m);
+        }
         if (added) this.bus.emit('message');
         this.scheduleFlush();
       }),
@@ -384,6 +452,7 @@ export class WaClient {
     sock.ev.on(
       'contacts.upsert',
       guard('contacts.upsert', (c) => {
+        this.contactsSeen += c.length;
         this.store.ingestContacts(c);
         this.scheduleFlush();
       }),
@@ -391,10 +460,92 @@ export class WaClient {
     sock.ev.on(
       'contacts.update',
       guard('contacts.update', (c) => {
+        this.contactsSeen += c.length;
         this.store.ingestContacts(c);
         this.scheduleFlush();
       }),
     );
+    sock.ev.on(
+      'messages.update',
+      guard('messages.update', (updates) => {
+        for (const u of updates as MessageUpdateEvent[]) this.applyMessageStatus(u);
+      }),
+    );
+    sock.ev.on(
+      'message-receipt.update',
+      guard('message-receipt.update', (updates) => {
+        for (const u of updates as ReceiptUpdateEvent[]) this.applyUserReceipt(u);
+      }),
+    );
+  }
+
+  /** Chat id used in receipts: LID chats map to their phone JID. */
+  private chatJid(key: { remoteJid?: string | null; remoteJidAlt?: string | null }): string {
+    const jid = key.remoteJid ?? '';
+    return jid.endsWith('@lid') && key.remoteJidAlt ? key.remoteJidAlt : jid;
+  }
+
+  /** Record a delivery/read receipt and mirror it to the webhook sink. */
+  private recordReceipt(chat: string, messageId: string, status: DeliveryStatus, participant?: string): void {
+    const rec: ReceiptRecord = {
+      message_id: messageId,
+      chat,
+      status,
+      ts: Math.floor(this.now() / 1000),
+      ...(participant ? { participant } : {}),
+    };
+    try {
+      this.store.recordReceipt(rec);
+    } catch (err) {
+      this.log(`recordReceipt failed: ${String(err)}`);
+    }
+    if (this.webhook) void this.webhook.emit('receipt', { ...rec }).catch(() => undefined);
+  }
+
+  /** Handle a status change (sent/delivered/read/played/error) for one of our messages. */
+  private applyMessageStatus(update: MessageUpdateEvent): void {
+    const status = update.update?.status;
+    const id = update.key?.id;
+    if (status === undefined || status === null || !id) return;
+    const mapped = WA_STATUS[status];
+    if (!mapped) return;
+    this.recordReceipt(this.chatJid(update.key ?? {}), id, mapped);
+  }
+
+  /** Handle a per-user read/played receipt. */
+  private applyUserReceipt(update: ReceiptUpdateEvent): void {
+    const id = update.key?.id;
+    if (!id) return;
+    const receipt = update.receipt ?? {};
+    const played = toUnixSeconds(receipt.playedTimestamp ?? null);
+    const read = toUnixSeconds(receipt.readTimestamp ?? null);
+    const delivered = toUnixSeconds(receipt.receiptTimestamp ?? null);
+    const participant = receipt.userJid ?? update.key?.participant ?? undefined;
+    if (played !== null) this.recordReceipt(this.chatJid(update.key ?? {}), id, 'played', participant);
+    else if (read !== null) this.recordReceipt(this.chatJid(update.key ?? {}), id, 'read', participant);
+    else if (delivered !== null) this.recordReceipt(this.chatJid(update.key ?? {}), id, 'delivered', participant);
+  }
+
+  /** Push a newly received inbound message to the external webhook sink. */
+  private pushInbound(m: WAMessage): void {
+    if (!this.webhook) return;
+    const key = m.key;
+    if (!key?.id) return;
+    const desc = describeMessage(m);
+    const chat = this.chatJid({ remoteJid: key.remoteJid, remoteJidAlt: key.remoteJidAlt });
+    const ts = toUnixSeconds(m.messageTimestamp) ?? Math.floor(this.now() / 1000);
+    void this.webhook
+      .emit('message', {
+        id: key.id,
+        chat,
+        from: key.participantAlt ?? key.participant ?? chat,
+        push_name: m.pushName ?? null,
+        ts,
+        type: desc?.type ?? 'unknown',
+        text: desc?.text ?? '',
+        has_media: desc ? desc.type !== 'text' : false,
+      })
+      .catch(() => undefined);
   }
 
   private safeIngest(m: WAMessage): boolean {
@@ -538,6 +689,7 @@ export class WaClient {
       if (sent?.key?.id) {
         ids.push(sent.key.id);
         this.safeIngest(sent);
+        this.recordReceipt(jid, sent.key.id, 'sent');
       }
     }
     this.scheduleFlush();
@@ -565,7 +717,15 @@ export class WaClient {
   async getMessages(chat: string, limit: number): Promise<StoredMessage[]> {
     await this.ensureStarted();
     this.requirePaired();
-    return this.store.getMessages(normalizeJid(chat), limit);
+    const jid = normalizeJid(chat);
+    const messages = this.store.getMessages(jid, limit);
+    const receipts = this.store.listReceipts(500, jid);
+    if (receipts.length === 0) return messages;
+    const statusById = new Map(receipts.map((r) => [r.message_id, r.status]));
+    return messages.map((m) => {
+      const status = statusById.get(m.id);
+      return status ? { ...m, status } : m;
+    });
   }
 
   async searchContacts(query: string, limit: number): Promise<ContactHit[]> {
@@ -740,10 +900,58 @@ export class WaClient {
     return { buffer, mimetype: mediaMimetypeOf(raw) ?? 'application/octet-stream' };
   }
 
-  async listContacts(limit: number): Promise<ContactHit[]> {
+  async listContacts(limit: number, query?: string): Promise<ContactHit[]> {
     await this.ensureStarted();
     this.requirePaired();
-    return this.store.listContacts(limit);
+    const all = this.store.listContacts(100_000);
+    const q = query?.trim().toLowerCase() ?? '';
+    const filtered = q
+      ? all.filter((c) => c.name.toLowerCase().includes(q) || (c.number ?? '').includes(q) || c.id.toLowerCase().includes(q))
+      : all;
+    return filtered.slice(0, limit);
+  }
+
+  /** Ask the server to resend contacts and report what landed in the store. */
+  async syncContacts(): Promise<{ synced: number; total: number }> {
+    await this.ensureStarted();
+    this.requirePaired();
+    const sock = await this.requireReady();
+    const before = this.contactsSeen;
+    const resync = (sock as unknown as { resyncAppState?: (c: readonly string[], initial: boolean) => Promise<void> }).resyncAppState;
+    if (typeof resync === 'function') {
+      try {
+        await resync.call(sock, ['regular_high'], false);
+      } catch (err) {
+        this.log('contact resync failed: ' + String(err));
+      }
+    }
+    // The server pushes contacts.upsert; give it a moment, then count.
+    const deadline = Date.now() + 2000;
+    while (this.contactsSeen === before && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    return { synced: Math.max(0, this.contactsSeen - before), total: this.store.listContacts(100_000).length };
+  }
+
+  /** Delivery/read receipts for messages we sent (newest first). */
+  async listReceipts(limit: number, chat?: string): Promise<ReceiptRecord[]> {
+    await this.ensureStarted();
+    return this.store.listReceipts(limit, chat ? normalizeJid(chat) : undefined);
+  }
+
+  /** Status of the outbound webhook sink. */
+  webhookStatus(): WebhookStatus {
+    return (
+      this.webhook?.status() ?? {
+        enabled: false,
+        url: null,
+        delivered: 0,
+        failed: 0,
+        last_error: null,
+        last_delivery_at: null,
+        last_event_at: null,
+      }
+    );
   }
 
   async newMessages(sinceTs: number, limit: number, chat?: string): Promise<StoredMessage[]> {
@@ -800,7 +1008,13 @@ export class WaClient {
   }
 
   /** Revoke one of your own messages for everyone. */
-  async remove(chat: string, messageId: string): Promise<{ chat: string; message_id: string; revoked: boolean }> {
+  async remove(chat: string, messageId: string, confirmed = false): Promise<{ chat: string; message_id: string; revoked: boolean }> {
+    // The confirmation check comes FIRST: refusing is a decision about the
+    // request, not about the connection, so an unpaired server must still
+    // answer CONFIRMATION_REQUIRED (and must not start a connection attempt).
+    if (!confirmed) {
+      throw new WaError('CONFIRMATION_REQUIRED', 'Deleting a message for everyone cannot be undone.', 'pass confirm: true to delete_message');
+    }
     const jid = normalizeJid(chat);
     const sock = await this.requireReady();
     const content = { delete: { remoteJid: jid, id: messageId, fromMe: true } } as unknown as AnyMessageContent;
@@ -829,7 +1043,11 @@ export class WaClient {
     return jid;
   }
 
-  async leaveGroup(chat: string): Promise<{ chat: string; left: boolean }> {
+  async leaveGroup(chat: string, confirmed = false): Promise<{ chat: string; left: boolean }> {
+    // Confirm first: the refusal must not depend on the connection state.
+    if (!confirmed) {
+      throw new WaError('CONFIRMATION_REQUIRED', 'Leaving a group removes you from it and cannot be undone.', 'pass confirm: true to leave_group');
+    }
     const jid = this.requireGroup(normalizeJid(chat));
     const sock = await this.requireReady();
     if (!sock.groupLeave) throw new WaError('NOT_CONNECTED', 'Group admin is unavailable on this connection.');
@@ -846,7 +1064,13 @@ export class WaClient {
     chat: string,
     action: 'add' | 'remove' | 'promote' | 'demote',
     phones: string[],
+    confirmed = false,
   ): Promise<{ chat: string; action: string; results: { status?: string; jid?: string }[] }> {
+    // Confirm first for every destructive action: the refusal must not depend
+    // on the connection state, and must not trigger a connection attempt.
+    if (action !== 'add' && !confirmed) {
+      throw new WaError('CONFIRMATION_REQUIRED', `Group ${action} changes the group and cannot be undone.`, 'pass confirm: true to group_participants');
+    }
     const jid = this.requireGroup(normalizeJid(chat));
     if (phones.length === 0) throw new WaError('INVALID_ARGUMENT', 'phones must contain at least one number.');
     const targets = phones.map((p) => {
