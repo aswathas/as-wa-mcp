@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import path from 'node:path';
+import { readFileSync, rmSync } from 'node:fs';
 import qrcode from 'qrcode-terminal';
-import { defaultAuthDir, isRegistered, liveRuntime, readMe } from './auth.js';
+import { defaultAuthDir, isPidAlive, isRegistered, liveRuntime, readMe } from './auth.js';
 import { baileysFactory } from './baileys.js';
 import { WaClient } from './client.js';
 import { WaError, fail, notPairedError, ok } from './errors.js';
@@ -47,6 +48,7 @@ const USAGE = `wa-mcp CLI
   group-set <chat> [--subject <s>] [--description <d>]   rename/redescribe a group
   create-group <subject> <phone...>    create a new group
   code "<js>" [--timeout ms]            run a code-mode snippet (wa.* helpers, wa.files, resumable waits)
+  stop                                 stop the shared wa-mcp http daemon
 `;
 
 const log = (msg: string): void => {
@@ -410,6 +412,27 @@ async function cmdCode(authDir: string, args: string[]): Promise<Envelope<unknow
   }
 }
 
+function cmdStop(authDir: string): Envelope<unknown> {
+  const pidFile = path.join(authDir, 'httpd.pid');
+  let pid = 0;
+  try {
+    pid = Number(readFileSync(pidFile, 'utf8').trim());
+  } catch {
+    pid = 0;
+  }
+  if (!pid || !isPidAlive(pid)) {
+    rmSync(pidFile, { force: true });
+    return ok({ stopped: false, reason: 'daemon not running' });
+  }
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (err) {
+    return fail(new WaError('INTERNAL', 'Could not stop the daemon (pid ' + pid + ').', String(err)));
+  }
+  rmSync(pidFile, { force: true });
+  return ok({ stopped: true, pid });
+}
+
 async function main(): Promise<number> {
   const [cmd, ...args] = process.argv.slice(2);
   const authDir = defaultAuthDir();
@@ -508,6 +531,9 @@ async function main(): Promise<number> {
         break;
       case 'code':
         env = await cmdCode(authDir, args);
+        break;
+      case 'stop':
+        env = cmdStop(authDir);
         break;
       case 'create-group':
         env = await cmdCreateGroup(authDir, args);

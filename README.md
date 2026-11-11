@@ -69,6 +69,41 @@ claude mcp add whatsapp -- node C:/Users/aswat/Projects/wa-mcp/dist/mcp.js
 
 > Run **one** process per session. If the CLI `send`/`sync` is used while the MCP server is live, the CLI refuses (use `--force` to override; it will kick the other connection off — WhatsApp allows one connection per linked device).
 
+## Shared HTTP transport (many agents, one WhatsApp session)
+
+WhatsApp allows **one live connection per linked device**. Over stdio every agent spawns its own server, so only the first one holds the session and the rest fall back to read-only. The HTTP transport fixes that: one daemon owns the session and serves every agent.
+
+```
+agent A ──stdio──┐
+agent B ──stdio──┼── bridge (dist/launch.js) ──http── daemon (dist/http.js) ── WhatsApp
+agent C ──stdio──┘
+```
+
+Point every agent at the bridge. It starts the daemon if needed and exits the daemon when the last client leaves.
+
+```json
+{
+  "mcpServers": {
+    "whatsapp-code": {
+      "command": "node",
+      "args": ["C:/Users/aswat/Projects/wa-mcp/dist/launch.js"]
+    }
+  }
+}
+```
+
+```bash
+node dist/http.js --port 8765        # daemon (usually started by the bridge)
+node dist/http.js --always-on         # never exit on idle
+node dist/cli.js stop                 # stop the running daemon
+```
+
+- Daemon endpoint: `http://127.0.0.1:8765/mcp`. `GET /health` returns `{ ok, pid, sessions, authDir }`.
+- Bridge env: `WA_MCP_HTTP_PORT` (default 8765), `WA_MCP_AUTH_DIR`.
+- Daemon flags: `--port`, `--idle-ms` (default 60000), `--stale-ms` (default 90000), `--auth-dir`, `--always-on`.
+- The daemon exits after `--idle-ms` with **no** connected clients, so closing the last agent stops it. With `WA_MCP_WEBHOOK_URL` set it stays up (live inbound listener).
+- A client that dies without a clean shutdown is dropped after `--stale-ms` of silence.
+
 ## Tool reference
 
 All tools return `{ "ok": true, "data": …, "error": null }` or `{ "ok": false, "data": null, "error": { "code", "message", "hint?" } }`.
@@ -143,6 +178,8 @@ MCP config:
   }
 }
 ```
+
+To run several agents against the same WhatsApp session, use `dist/launch.js` instead — see [Shared HTTP transport](#shared-http-transport-many-agents-one-whatsapp-session).
 
 **The contract**
 
